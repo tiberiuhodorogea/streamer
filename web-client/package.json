@@ -1,0 +1,13 @@
+{
+  "name": "web-client",
+  "version": "0.1.0",
+  "description": "Web viewer client for P2P streaming",
+  "type": "module",
+  "scripts": {
+    "start": "npx http-server -p 3000 -o",
+    "dev": "npx http-server -p 3000"
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "p2p-streaming-poc",
+  "version": "0.1.0",
+  "description": "Fast P2P streaming application - POC",
+  "private": true,
+  "workspaces": [
+    "signaling-server",
+    "streamer-app",
+    "web-client",
+    "shared"
+  ],
+  "scripts": {
+    "install": "npm install --workspaces",
+    "dev": "npm run dev --workspaces",
+    "build": "npm run build --workspaces",
+    "start:signaling": "npm start --workspace=signaling-server",
+    "start:streamer": "npm start --workspace=streamer-app",
+    "start:web": "npm start --workspace=web-client"
+  },
+  "keywords": ["p2p", "streaming", "webrtc", "gaming"],
+  "author": "",
+  "license": "MIT"
+}

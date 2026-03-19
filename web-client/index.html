@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>P2P Stream - Viewer</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <h1>🎮 P2P Stream - Viewer</h1>
+      <div class="status-badge" id="status">Disconnected</div>
+    </header>
+
+    <main>
+      <!-- Connection Setup -->
+      <section class="setup-panel" id="setupPanel">
+        <h2>Connect to Stream</h2>
+        <div class="form-group">
+          <label>Server URL:</label>
+          <input type="text" id="serverUrl" value="ws://localhost:4000" placeholder="ws://localhost:4000">
+        </div>
+        <div class="form-group">
+          <label>Your Name:</label>
+          <input type="text" id="viewerName" placeholder="Your Name" value="Viewer 1">
+        </div>
+        <button id="connectBtn" class="btn btn-primary">Connect to Server</button>
+      </section>
+
+      <!-- Stream Selection -->
+      <section class="streams-panel" id="streamsPanel" style="display: none;">
+        <h2>Available Streams</h2>
+        <div class="streams-list" id="streamsList">
+          <p>Loading streams...</p>
+        </div>
+        <button id="refreshStreamsBtn" class="btn btn-secondary">Refresh</button>
+      </section>
+
+      <!-- Video Player -->
+      <section class="player-panel" id="playerPanel" style="display: none;">
+        <h2>Now Watching</h2>
+        <div class="player-container">
+          <video id="remoteVideo" autoplay playsinline controls></video>
+          <div class="player-overlay">
+            <div class="stream-info">
+              <span id="streamTitle" class="title"></span>
+              <span id="connectionQuality" class="quality"></span>
+            </div>
+          </div>
+        </div>
+        <div class="player-controls">
+          <button id="playPauseBtn" class="btn btn-secondary btn-small">Pause</button>
+          <button id="muteBtn" class="btn btn-secondary btn-small">Mute</button>
+          <button id="fullscreenBtn" class="btn btn-primary btn-small">Fullscreen</button>
+        </div>
+        <div class="video-stats">
+          <div class="stat">
+            <span class="label">Resolution:</span>
+            <span id="resolution" class="value">-- p</span>
+          </div>
+          <div class="stat">
+            <span class="label">FPS:</span>
+            <span id="streamFps" class="value">--</span>
+          </div>
+          <div class="stat">
+            <span class="label">Bitrate:</span>
+            <span id="streamBitrate" class="value">-- Mbps</span>
+          </div>
+          <div class="stat">
+            <span class="label">Latency:</span>
+            <span id="latency" class="value">-- ms</span>
+          </div>
+        </div>
+        <button id="disconnectBtn" class="btn btn-danger">Disconnect</button>
+      </section>
+
+      <section class="debug-panel" id="debugPanel">
+        <div class="debug-header">
+          <h2>Debug Console</h2>
+          <button id="clearDebugBtn" class="btn btn-secondary btn-small">Clear Logs</button>
+        </div>
+        <div class="debug-console" id="debugConsole"></div>
+      </section>
+    </main>
+
+    <!-- Error Display -->
+    <div id="errorModal" class="modal" style="display: none;">
+      <div class="modal-content">
+        <h3>Error</h3>
+        <p id="errorMessage"></p>
+        <button onclick="document.getElementById('errorModal').style.display='none'" class="btn btn-primary">Dismiss</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=viewer-ws-2"></script>
+</body>
+</html>

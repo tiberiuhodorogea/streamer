@@ -1,0 +1,17 @@
+{
+  "name": "signaling-server",
+  "version": "0.1.0",
+  "description": "WebRTC signaling server",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.6.2",
+    "ws": "^8.19.0"
+  }
+}

@@ -1,8 +1,7 @@
-const { app, BrowserWindow, Menu, ipcMain, desktopCapturer, dialog, session } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer } = require('electron');
 const path = require('path');
 
 let mainWindow;
-let streamerSocket = null;
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({
@@ -57,31 +56,4 @@ ipcMain.handle('get-capture-sources', async () => {
   }
 });
 
-// IPC Handler: Start capture stream
-ipcMain.handle('start-capture', async (event, sourceId) => {
-  try {
-    console.log(`[CAPTURE] Starting capture for source: ${sourceId}`);
-    console.log('[CAPTURE] Requesting getUserMedia with desktop source');
-    
-    const stream = await mainWindow.webContents.executeJavaScript(`
-      navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: '${sourceId}',
-            maxWidth: 1920,
-            maxHeight: 1080,
-            maxFrameRate: 60
-          }
-        }
-      })
-    `);
-    
-    console.log('[CAPTURE] Stream obtained successfully');
-    return { success: true, streamId: stream.id };
-  } catch (error) {
-    console.error('[CAPTURE] Error:', error.message);
-    return { success: false, error: error.message };
-  }
-});
+

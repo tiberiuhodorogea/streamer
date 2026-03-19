@@ -1,8 +1,17 @@
+﻿// ============================================
+// SIGNALING CLIENT WITH AUTO-RECONNECT
+// ============================================
 class RawSignalClient {
   constructor(url) {
     this.url = url;
     this.ws = null;
     this.listeners = {};
+    this._reconnectAttempts = 0;
+    this._maxReconnectAttempts = 10;
+    this._reconnectDelay = 1000;
+    this._maxReconnectDelay = 15000;
+    this._shouldReconnect = true;
+    this._intentionalClose = false;
     this.connect();
   }
 
@@ -10,34 +19,63 @@ class RawSignalClient {
     const baseUrl = this.url
       .replace(/^http:\/\//i, 'ws://')
       .replace(/^https:\/\//i, 'wss://');
-    return baseUrl.endsWith('/ws') ? baseUrl : `${baseUrl}/ws`;
+    return baseUrl.endsWith('/ws') ? baseUrl : baseUrl + '/ws';
   }
 
   connect() {
+    this._intentionalClose = false;
     const wsUrl = this.normalizedUrl();
-    debugConsole.info(`Opening raw WebSocket: ${wsUrl}`);
-    this.ws = new WebSocket(wsUrl);
+    debugConsole.info('Opening WebSocket: ' + wsUrl);
+    try {
+      this.ws = new WebSocket(wsUrl);
 
-    this.ws.onopen = () => {
-      this.fire('connect');
-    };
+      this.ws.onopen = () => {
+        this._reconnectAttempts = 0;
+        this.fire('connect');
+      };
 
-    this.ws.onmessage = (event) => {
-      try {
-        const [eventName, payload] = JSON.parse(event.data);
-        this.fire(eventName, payload);
-      } catch (error) {
-        debugConsole.error(`WebSocket parse error: ${error.message}`);
+      this.ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (!Array.isArray(msg) || msg.length < 2) return;
+          const [eventName, payload] = msg;
+          this.fire(eventName, payload);
+        } catch (error) {
+          debugConsole.error('WebSocket parse error: ' + error.message);
+        }
+      };
+
+      this.ws.onerror = () => {
+        this.fire('connect_error', new Error('websocket error'));
+      };
+
+      this.ws.onclose = () => {
+        this.fire('disconnect', 'socket closed');
+        if (this._shouldReconnect && !this._intentionalClose) {
+          this._scheduleReconnect();
+        }
+      };
+    } catch (err) {
+      debugConsole.error('Connection failed: ' + err.message);
+      if (this._shouldReconnect) {
+        this._scheduleReconnect();
       }
-    };
+    }
+  }
 
-    this.ws.onerror = () => {
-      this.fire('connect_error', new Error('websocket error'));
-    };
-
-    this.ws.onclose = () => {
-      this.fire('disconnect', 'socket closed');
-    };
+  _scheduleReconnect() {
+    if (this._reconnectAttempts >= this._maxReconnectAttempts) {
+      debugConsole.error('Max reconnection attempts reached');
+      this.fire('reconnect_failed');
+      return;
+    }
+    this._reconnectAttempts++;
+    const base = Math.min(this._reconnectDelay * Math.pow(1.5, this._reconnectAttempts - 1), this._maxReconnectDelay);
+    const jitter = base * 0.2 * Math.random();
+    const delay = Math.round(base + jitter);
+    debugConsole.info('Reconnecting in ' + delay + 'ms (attempt ' + this._reconnectAttempts + ')');
+    this.fire('reconnecting', { attempt: this._reconnectAttempts, delay });
+    setTimeout(() => this.connect(), delay);
   }
 
   on(eventName, callback) {
@@ -47,15 +85,17 @@ class RawSignalClient {
     this.listeners[eventName].push(callback);
   }
 
-  emit(eventName, payload = {}) {
+  emit(eventName, payload) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      debugConsole.warn(`Cannot send ${eventName}: socket not open`);
+      debugConsole.warn('Cannot send ' + eventName + ': socket not open');
       return;
     }
-    this.ws.send(JSON.stringify([eventName, payload]));
+    this.ws.send(JSON.stringify([eventName, payload || {}]));
   }
 
   disconnect() {
+    this._intentionalClose = true;
+    this._shouldReconnect = false;
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -64,10 +104,13 @@ class RawSignalClient {
 
   fire(eventName, payload) {
     const callbacks = this.listeners[eventName] || [];
-    callbacks.forEach((callback) => callback(payload));
+    callbacks.forEach((cb) => cb(payload));
   }
 }
 
+// ============================================
+// DEBUG CONSOLE
+// ============================================
 class DebugConsole {
   constructor() {
     this.lines = [];
@@ -76,10 +119,7 @@ class DebugConsole {
 
   write(level, message) {
     const time = new Date().toLocaleTimeString('en-US', {
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
+      hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
     this.lines.push({ level, message, time });
     if (this.lines.length > this.maxLines) {
@@ -88,25 +128,10 @@ class DebugConsole {
     this.render();
   }
 
-  info(message) {
-    console.log(message);
-    this.write('info', message);
-  }
-
-  warn(message) {
-    console.warn(message);
-    this.write('warn', message);
-  }
-
-  error(message) {
-    console.error(message);
-    this.write('error', message);
-  }
-
-  success(message) {
-    console.log(message);
-    this.write('success', message);
-  }
+  info(message) { console.log(message); this.write('info', message); }
+  warn(message) { console.warn(message); this.write('warn', message); }
+  error(message) { console.error(message); this.write('error', message); }
+  success(message) { console.log(message); this.write('success', message); }
 
   clear() {
     this.lines = [];
@@ -115,16 +140,10 @@ class DebugConsole {
 
   render() {
     const root = document.getElementById('debugConsole');
-    if (!root) {
-      return;
-    }
-
-    root.innerHTML = this.lines.map((line) => `
-      <div class="debug-line">
-        <span class="debug-time">[${line.time}]</span>
-        <span class="debug-${line.level}">${line.message}</span>
-      </div>
-    `).join('');
+    if (!root) return;
+    root.innerHTML = this.lines.map((line) =>
+      '<div class="debug-line"><span class="debug-time">[' + line.time + ']</span> <span class="debug-' + line.level + '">' + line.message + '</span></div>'
+    ).join('');
     root.scrollTop = root.scrollHeight;
   }
 }
@@ -132,14 +151,26 @@ class DebugConsole {
 const debugConsole = new DebugConsole();
 
 window.addEventListener('error', (event) => {
-  debugConsole.error(`Window error: ${event.message}`);
+  debugConsole.error('Window error: ' + event.message);
 });
 
 window.addEventListener('unhandledrejection', (event) => {
   const message = event.reason?.message || String(event.reason);
-  debugConsole.error(`Unhandled promise rejection: ${message}`);
+  debugConsole.error('Unhandled rejection: ' + message);
 });
 
+// ============================================
+// ICE SERVERS
+// ============================================
+const ICE_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  { urls: ['stun:stun2.l.google.com:19302', 'stun:stun3.l.google.com:19302'] },
+  { urls: ['stun:stun4.l.google.com:19302'] }
+];
+
+// ============================================
+// VIEWER APP
+// ============================================
 class ViewerApp {
   constructor() {
     this.socket = null;
@@ -149,11 +180,14 @@ class ViewerApp {
     this.selectedStreamerName = '';
     this.statsInterval = null;
     this.connectTimeout = null;
-    this.audioMuted = false;
-    this.receiverSyncHintSeconds = 0.25;
+    this.audioMuted = true;
+    this.receiverSyncHintSeconds = 0.15;
+    // Stats tracking
+    this._prevBytesReceived = 0;
+    this._prevFramesDecoded = 0;
+    this._prevStatsTimestamp = 0;
 
     this.initializeUI();
-    this.checkServerAvailability();
     debugConsole.info('Viewer app initialized');
   }
 
@@ -170,15 +204,12 @@ class ViewerApp {
     document.addEventListener('webkitfullscreenchange', () => this.syncFullscreenButton());
   }
 
-  async checkServerAvailability() {
-    try {
-      const response = await fetch('http://localhost:4000/health', { method: 'GET' });
-      if (response.ok) {
-        debugConsole.success('Initial health check succeeded');
-      }
-    } catch (error) {
-      debugConsole.warn(`Initial health check failed: ${error.message}`);
-    }
+  getServerUrl() {
+    return document.getElementById('serverUrl').value.trim();
+  }
+
+  getHttpUrl() {
+    return this.getServerUrl().replace('ws://', 'http://').replace('wss://', 'https://');
   }
 
   setStatus(status, color = 'gray') {
@@ -194,12 +225,11 @@ class ViewerApp {
   }
 
   async connect() {
-    const serverUrl = document.getElementById('serverUrl').value.trim();
+    const serverUrl = this.getServerUrl();
     const viewerName = document.getElementById('viewerName').value.trim();
 
     debugConsole.info('Connect requested');
-    debugConsole.info(`Server URL: ${serverUrl}`);
-    debugConsole.info(`Viewer name: ${viewerName}`);
+    debugConsole.info('Server: ' + serverUrl);
 
     if (!serverUrl || !viewerName) {
       this.showError('Please fill in all fields');
@@ -207,18 +237,17 @@ class ViewerApp {
     }
 
     if (this.socket) {
-      debugConsole.warn('Closing previous socket before reconnecting');
+      debugConsole.warn('Closing previous socket');
       this.socket.disconnect();
       this.socket = null;
     }
 
     this.setStatus('Connecting...', 'blue');
-    debugConsole.info('Creating raw signaling client');
     this.socket = new RawSignalClient(serverUrl);
 
     clearTimeout(this.connectTimeout);
     this.connectTimeout = setTimeout(() => {
-      debugConsole.warn('Connect timeout reached after 10 seconds');
+      debugConsole.warn('Connect timeout after 10s');
     }, 10000);
 
     this.socket.on('connect', () => {
@@ -231,17 +260,23 @@ class ViewerApp {
 
     this.socket.on('connect_error', (error) => {
       clearTimeout(this.connectTimeout);
-      debugConsole.error(`Connect error: ${error.message}`);
+      debugConsole.error('Connect error: ' + error.message);
       this.setStatus('Connection Error', 'red');
     });
 
-    this.socket.on('streamer-joined', (data) => {
-      debugConsole.info(`Streamer joined: ${data.streamerId}`);
+    this.socket.on('reconnecting', (info) => {
+      this.setStatus('Reconnecting (' + info.attempt + ')...', 'orange');
+    });
+
+    this.socket.on('reconnect_failed', () => {
+      this.setStatus('Connection Lost', 'red');
+    });
+
+    this.socket.on('streamer-joined', () => {
       this.loadAvailableStreams();
     });
 
     this.socket.on('streamer-left', (data) => {
-      debugConsole.warn(`Streamer left: ${data.streamerId}`);
       if (this.selectedStreamer === data.streamerId) {
         this.handleStreamerDisconnected();
       }
@@ -249,7 +284,7 @@ class ViewerApp {
     });
 
     this.socket.on('offer', async (data) => {
-      debugConsole.info('Received WebRTC offer from streamer');
+      debugConsole.info('Received WebRTC offer');
       await this.handleOffer(data);
     });
 
@@ -257,7 +292,7 @@ class ViewerApp {
       const { candidate } = data;
       if (this.peerConnection && candidate) {
         this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
-          .catch(err => debugConsole.error(`Error adding ICE candidate: ${err.message}`));
+          .catch(err => debugConsole.error('ICE candidate error: ' + err.message));
       }
     });
 
@@ -268,27 +303,22 @@ class ViewerApp {
 
     this.socket.on('disconnect', (reason) => {
       clearTimeout(this.connectTimeout);
-      debugConsole.warn(`Socket disconnected: ${reason}`);
-      this.setStatus('Disconnected', 'red');
-      this.hidePlayerPanel();
-      this.showSetupPanel();
+      debugConsole.warn('Socket disconnected: ' + reason);
+      this.setStatus('Reconnecting...', 'orange');
     });
 
     this.socket.on('error', (error) => {
-      debugConsole.error(`Socket error: ${error?.message || error}`);
-      this.showError(`Connection error: ${error?.message || error}`);
+      debugConsole.error('Socket error: ' + (error?.message || error));
     });
   }
 
   async loadAvailableStreams() {
     try {
-      const streamsUrl = `${document.getElementById('serverUrl').value}/streamers`
-        .replace('ws://', 'http://')
-        .replace('wss://', 'https://');
-      debugConsole.info(`Loading streams from ${streamsUrl}`);
+      const streamsUrl = this.getHttpUrl() + '/streamers';
+      debugConsole.info('Loading streams from ' + streamsUrl);
       const response = await fetch(streamsUrl);
       const streamers = await response.json();
-      debugConsole.success(`Loaded ${streamers.length} streamer(s)`);
+      debugConsole.success('Loaded ' + streamers.length + ' streamer(s)');
 
       const list = document.getElementById('streamsList');
       list.innerHTML = '';
@@ -302,13 +332,12 @@ class ViewerApp {
       streamers.forEach(streamer => {
         const item = document.createElement('div');
         item.className = 'stream-item';
-        item.innerHTML = `
-          <div class="stream-info-card">
-            <h3>${streamer.name || streamer.id.substring(0, 12)}</h3>
-            <p class="viewer-count">👥 ${streamer.viewerCount} watching</p>
-            <button class="btn btn-primary btn-small">Watch Stream</button>
-          </div>
-        `;
+        item.innerHTML =
+          '<div class="stream-info-card">' +
+            '<h3>' + (streamer.name || streamer.id.substring(0, 12)) + '</h3>' +
+            '<p class="viewer-count">' + streamer.viewerCount + ' watching</p>' +
+            '<button class="btn btn-primary btn-small">Watch Stream</button>' +
+          '</div>';
         item.querySelector('button').addEventListener('click', () => {
           this.joinStreamer(streamer);
         });
@@ -317,13 +346,13 @@ class ViewerApp {
 
       document.getElementById('streamsPanel').style.display = 'block';
     } catch (error) {
-      debugConsole.error(`Error loading streams: ${error.message}`);
-      document.getElementById('streamsList').innerHTML = `<p>Error loading streams: ${error.message}</p>`;
+      debugConsole.error('Error loading streams: ' + error.message);
+      document.getElementById('streamsList').innerHTML = '<p>Error loading streams: ' + error.message + '</p>';
     }
   }
 
   joinStreamer(streamer) {
-    debugConsole.info(`Joining streamer ${streamer.name || streamer.id}`);
+    debugConsole.info('Joining ' + (streamer.name || streamer.id));
     this.selectedStreamer = streamer.id;
     this.selectedStreamerName = streamer.name || streamer.id;
     document.getElementById('streamTitle').textContent = this.selectedStreamerName;
@@ -340,28 +369,25 @@ class ViewerApp {
   }
 
   setupPeerConnection() {
-    const config = {
-      iceServers: [
-        { urls: ['stun:stun.l.google.com:19302'] },
-        { urls: ['stun:stun1.l.google.com:19302'] }
-      ]
-    };
-
-    this.peerConnection = new RTCPeerConnection(config);
+    this.peerConnection = new RTCPeerConnection({
+      iceServers: ICE_SERVERS,
+      bundlePolicy: 'max-bundle',
+      sdpSemantics: 'unified-plan'
+    });
 
     this.peerConnection.ontrack = (event) => {
-      debugConsole.info(`Received remote track: ${event.track.kind}`);
+      debugConsole.info('Received track: ' + event.track.kind);
       if (event.streams[0]) {
         this.remoteStream = event.streams[0];
-        const remoteVideo = document.getElementById('remoteVideo');
-        remoteVideo.srcObject = this.remoteStream;
-        remoteVideo.muted = this.audioMuted;
+        const video = document.getElementById('remoteVideo');
+        video.srcObject = this.remoteStream;
+        video.muted = this.audioMuted;
         document.getElementById('connectionQuality').textContent = 'Live';
         this.showPlayerPanel();
         this.applyReceiverSyncPolicy();
         this.startStatsCollection();
-        remoteVideo.play().catch((error) => {
-          debugConsole.warn(`Autoplay required another tap: ${error.message}`);
+        video.play().catch((err) => {
+          debugConsole.warn('Autoplay blocked: ' + err.message);
         });
       }
     };
@@ -376,23 +402,17 @@ class ViewerApp {
     };
 
     this.peerConnection.onconnectionstatechange = () => {
-      debugConsole.info(`Peer connection state: ${this.peerConnection.connectionState}`);
-      document.getElementById('connectionQuality').textContent = this.peerConnection.connectionState;
-      if (this.peerConnection.connectionState === 'failed' ||
-        this.peerConnection.connectionState === 'disconnected' ||
-        this.peerConnection.connectionState === 'closed') {
+      const state = this.peerConnection.connectionState;
+      debugConsole.info('Peer state: ' + state);
+      document.getElementById('connectionQuality').textContent = state;
+      if (state === 'failed' || state === 'disconnected' || state === 'closed') {
         this.handleStreamerDisconnected();
       }
-    };
-
-    this.peerConnection.onicegatheringstatechange = () => {
-      debugConsole.info(`ICE gathering state: ${this.peerConnection.iceGatheringState}`);
     };
   }
 
   async handleOffer(data) {
     const { offer } = data;
-
     try {
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
       debugConsole.success('Remote description set');
@@ -400,77 +420,78 @@ class ViewerApp {
 
       const answer = await this.peerConnection.createAnswer();
       await this.peerConnection.setLocalDescription(answer);
-      debugConsole.success('Created and set local answer');
+      debugConsole.success('Answer created');
 
       this.socket.emit('answer', {
         streamerId: this.selectedStreamer,
         answer: answer
       });
     } catch (error) {
-      debugConsole.error(`Error handling offer: ${error.message}`);
-      this.showError(`Error establishing connection: ${error.message}`);
+      debugConsole.error('Error handling offer: ' + error.message);
+      this.showError('Connection error: ' + error.message);
     }
   }
 
   startStatsCollection() {
     if (this.statsInterval) clearInterval(this.statsInterval);
+    // Reset tracking
+    this._prevBytesReceived = 0;
+    this._prevFramesDecoded = 0;
+    this._prevStatsTimestamp = 0;
 
     this.statsInterval = setInterval(async () => {
       try {
         const stats = await this.peerConnection.getStats();
-        let inboundStats = null;
+        let inboundVideo = null;
 
         stats.forEach(report => {
           if (report.type === 'inbound-rtp' && report.kind === 'video') {
-            inboundStats = report;
+            inboundVideo = report;
           }
         });
 
-        if (inboundStats) {
-          const frameWidth = inboundStats.frameWidth || 0;
-          const frameHeight = inboundStats.frameHeight || 0;
-          const framesDecoded = inboundStats.framesDecoded || 0;
-          const bytesReceived = inboundStats.bytesReceived || 0;
-          let fps = null;
-          let bitrateMbps = null;
+        if (!inboundVideo) return;
 
-          // Calculate bitrate (bytes/sec to Mbps)
-          if (this.lastBytesReceived) {
-            const bytesDelta = bytesReceived - this.lastBytesReceived;
-            bitrateMbps = Number((bytesDelta * 8 / 1000000).toFixed(2));
-            document.getElementById('streamBitrate').textContent = `${bitrateMbps} Mbps`;
-          }
-          this.lastBytesReceived = bytesReceived;
+        const now = inboundVideo.timestamp;
+        const frameWidth = inboundVideo.frameWidth || 0;
+        const frameHeight = inboundVideo.frameHeight || 0;
+        const framesDecoded = inboundVideo.framesDecoded || 0;
+        const bytesReceived = inboundVideo.bytesReceived || 0;
 
-          if (frameWidth && frameHeight) {
-            document.getElementById('resolution').textContent = `${frameWidth}x${frameHeight}`;
-          }
+        let fps = null;
+        let bitrateMbps = null;
 
-          // Estimate FPS
-          if (this.lastFramesDecoded !== undefined) {
-            const frameDelta = framesDecoded - this.lastFramesDecoded;
-            fps = Number((frameDelta / 1).toFixed(0));
+        if (this._prevStatsTimestamp > 0) {
+          const elapsed = (now - this._prevStatsTimestamp) / 1000;
+          if (elapsed > 0) {
+            const bytesDelta = bytesReceived - this._prevBytesReceived;
+            const frameDelta = framesDecoded - this._prevFramesDecoded;
+            bitrateMbps = Number(((bytesDelta * 8) / elapsed / 1000000).toFixed(2));
+            fps = Number((frameDelta / elapsed).toFixed(0));
+            document.getElementById('streamBitrate').textContent = bitrateMbps + ' Mbps';
             document.getElementById('streamFps').textContent = fps;
           }
-          this.lastFramesDecoded = framesDecoded;
+        }
 
-          // Latency (simplified)
-          const jitterMs = inboundStats.jitter ? Number((inboundStats.jitter * 1000).toFixed(0)) : null;
-          document.getElementById('latency').textContent = `${jitterMs ?? '--'} ms`;
+        this._prevBytesReceived = bytesReceived;
+        this._prevFramesDecoded = framesDecoded;
+        this._prevStatsTimestamp = now;
 
-          if (fps !== null && this.socket && this.selectedStreamer) {
-            this.socket.emit('viewer-quality-report', {
-              streamerId: this.selectedStreamer,
-              fps,
-              bitrateMbps,
-              frameWidth,
-              frameHeight,
-              jitterMs
-            });
-          }
+        if (frameWidth && frameHeight) {
+          document.getElementById('resolution').textContent = frameWidth + 'x' + frameHeight;
+        }
+
+        const jitterMs = inboundVideo.jitter ? Number((inboundVideo.jitter * 1000).toFixed(0)) : null;
+        document.getElementById('latency').textContent = (jitterMs != null ? jitterMs : '--') + ' ms';
+
+        if (fps !== null && this.socket && this.selectedStreamer) {
+          this.socket.emit('viewer-quality-report', {
+            streamerId: this.selectedStreamer,
+            fps, bitrateMbps, frameWidth, frameHeight, jitterMs
+          });
         }
       } catch (error) {
-        debugConsole.error(`Error collecting stats: ${error.message}`);
+        debugConsole.error('Stats error: ' + error.message);
       }
     }, 1000);
   }
@@ -494,23 +515,19 @@ class ViewerApp {
     const video = document.getElementById('remoteVideo');
     const button = document.getElementById('playPauseBtn');
     if (!video.srcObject) {
-      debugConsole.warn('Cannot change playback state before a stream is loaded');
+      debugConsole.warn('No stream loaded');
       return;
     }
-
     if (video.paused) {
       video.play().then(() => {
         button.textContent = 'Pause';
-        debugConsole.info('Playback resumed');
-      }).catch((error) => {
-        debugConsole.error(`Failed to resume playback: ${error.message}`);
+      }).catch((err) => {
+        debugConsole.error('Playback failed: ' + err.message);
       });
-      return;
+    } else {
+      video.pause();
+      button.textContent = 'Play';
     }
-
-    video.pause();
-    button.textContent = 'Play';
-    debugConsole.info('Playback paused');
   }
 
   toggleMute() {
@@ -519,25 +536,19 @@ class ViewerApp {
     this.audioMuted = !this.audioMuted;
     video.muted = this.audioMuted;
     button.textContent = this.audioMuted ? 'Unmute' : 'Mute';
-    debugConsole.info(this.audioMuted ? 'Viewer muted audio' : 'Viewer unmuted audio');
+    debugConsole.info(this.audioMuted ? 'Audio muted' : 'Audio unmuted');
   }
 
   applyReceiverSyncPolicy() {
-    if (!this.peerConnection) {
-      return;
-    }
-
+    if (!this.peerConnection) return;
     this.peerConnection.getReceivers().forEach((receiver) => {
-      if (!receiver.track || (receiver.track.kind !== 'audio' && receiver.track.kind !== 'video')) {
-        return;
-      }
-
+      if (!receiver.track) return;
       try {
         if ('playoutDelayHint' in receiver) {
           receiver.playoutDelayHint = this.receiverSyncHintSeconds;
         }
       } catch (error) {
-        debugConsole.warn(`Receiver sync hint unavailable for ${receiver.track.kind}: ${error.message}`);
+        debugConsole.warn('Sync hint unavailable for ' + receiver.track.kind);
       }
     });
   }
@@ -568,18 +579,16 @@ class ViewerApp {
       if (screen.orientation?.lock) {
         screen.orientation.lock('landscape').catch(() => {});
       }
-
       this.syncFullscreenButton();
-      debugConsole.info('Entered fullscreen mode');
     } catch (error) {
-      debugConsole.error(`Failed to toggle fullscreen: ${error.message}`);
+      debugConsole.error('Fullscreen error: ' + error.message);
     }
   }
 
   syncFullscreenButton() {
     const button = document.getElementById('fullscreenBtn');
-    const inFullscreen = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
-    button.textContent = inFullscreen ? 'Exit Fullscreen' : 'Fullscreen';
+    const inFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+    button.textContent = inFs ? 'Exit Fullscreen' : 'Fullscreen';
   }
 
   removeConnection() {
@@ -592,44 +601,29 @@ class ViewerApp {
       this.remoteStream.getTracks().forEach(track => track.stop());
       this.remoteStream = null;
     }
-    document.getElementById('remoteVideo').srcObject = null;
-    document.getElementById('remoteVideo').muted = this.audioMuted;
+    const video = document.getElementById('remoteVideo');
+    video.srcObject = null;
+    video.muted = true;
     document.getElementById('streamTitle').textContent = '';
     document.getElementById('connectionQuality').textContent = '';
     document.getElementById('playPauseBtn').textContent = 'Pause';
-    document.getElementById('muteBtn').textContent = 'Mute';
-    this.audioMuted = false;
+    document.getElementById('muteBtn').textContent = 'Unmute';
+    this.audioMuted = true;
+    this._prevBytesReceived = 0;
+    this._prevFramesDecoded = 0;
+    this._prevStatsTimestamp = 0;
     this.syncFullscreenButton();
   }
 
-  // UI management
-  hideSetupPanel() {
-    document.getElementById('setupPanel').style.display = 'none';
-  }
-
-  showSetupPanel() {
-    document.getElementById('setupPanel').style.display = 'block';
-  }
-
-  hideStreamsPanel() {
-    document.getElementById('streamsPanel').style.display = 'none';
-  }
-
-  showStreamsPanel() {
-    document.getElementById('streamsPanel').style.display = 'block';
-  }
-
-  hidePlayerPanel() {
-    document.getElementById('playerPanel').style.display = 'none';
-  }
-
-  showPlayerPanel() {
-    document.getElementById('playerPanel').style.display = 'block';
-  }
+  hideSetupPanel() { document.getElementById('setupPanel').style.display = 'none'; }
+  showSetupPanel() { document.getElementById('setupPanel').style.display = 'block'; }
+  hideStreamsPanel() { document.getElementById('streamsPanel').style.display = 'none'; }
+  showStreamsPanel() { document.getElementById('streamsPanel').style.display = 'block'; }
+  hidePlayerPanel() { document.getElementById('playerPanel').style.display = 'none'; }
+  showPlayerPanel() { document.getElementById('playerPanel').style.display = 'block'; }
 }
 
-// Initialize on page load
 document.addEventListener('DOMContentLoaded', () => {
-  debugConsole.info('DOM content loaded');
+  debugConsole.info('DOM loaded');
   window.app = new ViewerApp();
 });

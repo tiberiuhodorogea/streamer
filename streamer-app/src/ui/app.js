@@ -1,50 +1,79 @@
+﻿// ============================================
+// SIGNALING CLIENT WITH AUTO-RECONNECT
 // ============================================
-// WEBSOCKET CLIENT WITH SOCKET.IO PROTOCOL
-// ============================================
-class SocketIOClient {
+class SignalClient {
   constructor(url, options = {}) {
     this.url = url;
     this.options = options;
     this.ws = null;
     this.listeners = {};
     this.id = Math.random().toString(36).substr(2, 9);
-    this.transport = 'websocket';
-    this.messageId = 0;
+    this._reconnectAttempts = 0;
+    this._maxReconnectAttempts = options.reconnectionAttempts || 10;
+    this._reconnectDelay = options.reconnectionDelay || 1000;
+    this._maxReconnectDelay = options.reconnectionDelayMax || 15000;
+    this._shouldReconnect = options.reconnection !== false;
+    this._intentionalClose = false;
     this.connect();
   }
 
   connect() {
-    logger?.debug?.(`🔌 Connecting to ${this.url}`);
+    logger?.debug?.('Connecting to ' + this.url);
+    this._intentionalClose = false;
     try {
       this.ws = new WebSocket(this.url + '/ws');
 
       this.ws.onopen = () => {
-        logger?.info?.('✅ WebSocket connected');
+        logger?.info?.('WebSocket connected');
+        this._reconnectAttempts = 0;
         this._fireListeners('connect');
       };
 
       this.ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          if (!Array.isArray(data) || data.length < 2) return;
           const [eventName, eventData] = data;
           this._fireListeners(eventName, eventData);
         } catch (err) {
-          logger?.error?.(`Parse error: ${err.message}`);
+          logger?.error?.('Parse error: ' + err.message);
         }
       };
 
       this.ws.onerror = (error) => {
-        logger?.error?.(`WebSocket error`);
+        logger?.error?.('WebSocket error');
         this._fireListeners('error', error);
       };
 
       this.ws.onclose = () => {
-        logger?.warn?.(`⚠️ WebSocket closed`);
+        logger?.warn?.('WebSocket closed');
         this._fireListeners('disconnect');
+        if (this._shouldReconnect && !this._intentionalClose) {
+          this._scheduleReconnect();
+        }
       };
     } catch (err) {
-      logger?.error?.(`Connection failed: ${err.message}`);
+      logger?.error?.('Connection failed: ' + err.message);
+      if (this._shouldReconnect) {
+        this._scheduleReconnect();
+      }
     }
+  }
+
+  _scheduleReconnect() {
+    if (this._reconnectAttempts >= this._maxReconnectAttempts) {
+      logger?.error?.('Max reconnection attempts reached (' + this._maxReconnectAttempts + ')');
+      this._fireListeners('reconnect_failed');
+      return;
+    }
+    this._reconnectAttempts++;
+    // Exponential backoff with jitter
+    const base = Math.min(this._reconnectDelay * Math.pow(1.5, this._reconnectAttempts - 1), this._maxReconnectDelay);
+    const jitter = base * 0.2 * Math.random();
+    const delay = Math.round(base + jitter);
+    logger?.info?.('Reconnecting in ' + delay + 'ms (attempt ' + this._reconnectAttempts + '/' + this._maxReconnectAttempts + ')');
+    this._fireListeners('reconnecting', { attempt: this._reconnectAttempts, delay });
+    setTimeout(() => this.connect(), delay);
   }
 
   on(event, callback) {
@@ -56,8 +85,16 @@ class SocketIOClient {
 
   emit(event, data) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      const payload = JSON.stringify([event, data || {}]);
-      this.ws.send(payload);
+      this.ws.send(JSON.stringify([event, data || {}]));
+    }
+  }
+
+  close() {
+    this._intentionalClose = true;
+    this._shouldReconnect = false;
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
     }
   }
 
@@ -67,7 +104,7 @@ class SocketIOClient {
         try {
           callback(data);
         } catch (err) {
-          logger?.error?.(`Listener error: ${err.message}`);
+          logger?.error?.('Listener error: ' + err.message);
         }
       });
     }
@@ -80,8 +117,7 @@ class SocketIOClient {
 class DebugLogger {
   constructor() {
     this.logs = [];
-    this.maxLogs = 100;
-    console.log('[LOGGER] DebugLogger initialized');
+    this.maxLogs = 200;
   }
 
   getTime() {
@@ -90,21 +126,12 @@ class DebugLogger {
   }
 
   log(message, type = 'info') {
-    const entry = {
-      time: this.getTime(),
-      message,
-      type
-    };
+    const entry = { time: this.getTime(), message, type };
     this.logs.push(entry);
-    
     if (this.logs.length > this.maxLogs) {
       this.logs.shift();
     }
-
-    // Always log to browser console
-    console.log(`[${type.toUpperCase()}] ${message}`);
-    
-    // Render to debug panel
+    console.log('[' + type.toUpperCase() + '] ' + message);
     this.render();
   }
 
@@ -121,31 +148,23 @@ class DebugLogger {
 
   render() {
     try {
-      const debugConsole = document.getElementById('debugConsole');
-      if (!debugConsole) {
-        console.warn('[LOGGER] debugConsole element not found');
-        return;
-      }
-
-      debugConsole.innerHTML = this.logs.map(entry => `
-        <div class="log-entry">
-          <span class="log-time">[${entry.time}]</span>
-          <span class="log-${entry.type}">${entry.message}</span>
-        </div>
-      `).join('');
-
-      // Auto-scroll to bottom
-      setTimeout(() => {
-        debugConsole.scrollTop = debugConsole.scrollHeight;
-      }, 0);
+      const el = document.getElementById('debugConsole');
+      if (!el) return;
+      el.innerHTML = this.logs.map(e =>
+        '<div class="log-entry"><span class="log-time">[' + e.time + ']</span> <span class="log-' + e.type + '">' + e.message + '</span></div>'
+      ).join('');
+      setTimeout(() => { el.scrollTop = el.scrollHeight; }, 0);
     } catch (err) {
-      console.error('[LOGGER] Error rendering:', err);
+      console.error('[LOGGER] Render error:', err);
     }
   }
 }
 
 const logger = new DebugLogger();
 
+// ============================================
+// QUALITY PROFILES
+// ============================================
 const QUALITY_PROFILES = {
   smooth: {
     label: 'Smooth FPS',
@@ -180,14 +199,20 @@ const QUALITY_PROFILES = {
   ultra: {
     label: 'Ultra',
     hint: 'Push quality hard on excellent links',
-    summary: 'Native capture cap, 60 fps target, 35 Mbps cap',
+    summary: 'Native capture cap, 60 fps target, 50 Mbps cap',
     maxWidth: 3840,
     maxHeight: 2160,
     maxFrameRate: 60,
-    maxBitrate: 35_000_000,
-    degradationPreference: 'balanced'
+    maxBitrate: 50_000_000,
+    degradationPreference: 'maintain-resolution'
   }
 };
+
+const ICE_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  { urls: ['stun:stun2.l.google.com:19302', 'stun:stun3.l.google.com:19302'] },
+  { urls: ['stun:stun4.l.google.com:19302'] }
+];
 
 // ============================================
 // STREAMER APP
@@ -195,7 +220,6 @@ const QUALITY_PROFILES = {
 class StreamerApp {
   constructor() {
     try {
-      console.log('[APP] StreamerApp constructor called');
       this.socket = null;
       this.peers = new Map();
       this.peerSnapshots = new Map();
@@ -205,26 +229,25 @@ class StreamerApp {
       this.includeAudio = true;
       this.isBroadcasting = false;
       this.streamerName = '';
+      this.serverUrl = '';
       this.statsInterval = null;
       this.adaptationLevels = [
         { label: 'base', bitrateScale: 1, extraScale: 1 },
-        { label: 'step-1', bitrateScale: 0.8, extraScale: 1.25 },
-        { label: 'step-2', bitrateScale: 0.6, extraScale: 1.6 },
-        { label: 'step-3', bitrateScale: 0.45, extraScale: 2.0 }
+        { label: 'step-1', bitrateScale: 0.75, extraScale: 1.3 },
+        { label: 'step-2', bitrateScale: 0.55, extraScale: 1.7 },
+        { label: 'step-3', bitrateScale: 0.4, extraScale: 2.2 }
       ];
-      
-      logger.info('🚀 StreamerApp initializing...');
+
+      logger.info('StreamerApp initializing...');
       this.attachEventListeners();
-      logger.info('✅ Event listeners attached');
+      logger.info('Event listeners attached');
     } catch (err) {
       console.error('[APP] Constructor error:', err);
-      logger.error(`❌ Init error: ${err.message}`);
+      logger.error('Init error: ' + err.message);
     }
   }
 
   attachEventListeners() {
-    console.log('[APP] Attaching event listeners...');
-    
     const connectBtn = document.getElementById('connectBtn');
     const refreshBtn = document.getElementById('refreshSourcesBtn');
     const stopBtn = document.getElementById('stopStreamBtn');
@@ -232,59 +255,23 @@ class StreamerApp {
     const qualityProfile = document.getElementById('qualityProfile');
     const includeAudio = document.getElementById('includeAudio');
 
-    console.log('[APP] Connect button found:', !!connectBtn);
-    console.log('[APP] Refresh button found:', !!refreshBtn);
-    console.log('[APP] Stop button found:', !!stopBtn);
-    console.log('[APP] Clear logs button found:', !!clearLogsBtn);
-
-    if (connectBtn) {
-      connectBtn.addEventListener('click', (e) => {
-        console.log('[APP] Connect button clicked!', e);
-        logger.debug('🔘 Connect button clicked');
-        this.connect();
-      });
-      logger.debug('✅ Connect listener attached');
-    }
-
-    if (refreshBtn) {
-      refreshBtn.addEventListener('click', () => {
-        logger.debug('🔘 Refresh button clicked');
-        this.loadCaptureSources();
-      });
-      logger.debug('✅ Refresh listener attached');
-    }
-
-    if (stopBtn) {
-      stopBtn.addEventListener('click', () => {
-        logger.debug('🔘 Stop button clicked');
-        this.stopStreaming();
-      });
-      logger.debug('✅ Stop listener attached');
-    }
-
-    if (clearLogsBtn) {
-      clearLogsBtn.addEventListener('click', () => {
-        logger.clear();
-      });
-      logger.debug('✅ Clear logs listener attached');
-    }
+    if (connectBtn) connectBtn.addEventListener('click', () => this.connect());
+    if (refreshBtn) refreshBtn.addEventListener('click', () => this.loadCaptureSources());
+    if (stopBtn) stopBtn.addEventListener('click', () => this.stopStreaming());
+    if (clearLogsBtn) clearLogsBtn.addEventListener('click', () => logger.clear());
 
     if (qualityProfile) {
       qualityProfile.value = this.selectedProfileKey;
-      qualityProfile.addEventListener('change', () => {
-        this.setQualityProfile(qualityProfile.value);
-      });
+      qualityProfile.addEventListener('change', () => this.setQualityProfile(qualityProfile.value));
       this.refreshQualityProfileUi();
-      logger.debug('✅ Quality profile listener attached');
     }
 
     if (includeAudio) {
       includeAudio.checked = this.includeAudio;
       includeAudio.addEventListener('change', () => {
         this.includeAudio = includeAudio.checked;
-        logger.info(`🔊 Source audio ${this.includeAudio ? 'enabled' : 'disabled'}`);
+        logger.info('Source audio ' + (this.includeAudio ? 'enabled' : 'disabled'));
       });
-      logger.debug('✅ Include audio listener attached');
     }
   }
 
@@ -294,17 +281,16 @@ class StreamerApp {
 
   setQualityProfile(profileKey) {
     if (!QUALITY_PROFILES[profileKey]) {
-      logger.warn(`⚠️ Unknown profile requested: ${profileKey}`);
+      logger.warn('Unknown profile: ' + profileKey);
       return;
     }
-
     this.selectedProfileKey = profileKey;
     this.refreshQualityProfileUi();
-    logger.info(`🎛️ Quality profile set to ${QUALITY_PROFILES[profileKey].label}`);
+    logger.info('Quality profile set to ' + QUALITY_PROFILES[profileKey].label);
 
     if (this.localStream) {
       this.applyLiveProfile().catch((error) => {
-        logger.warn(`⚠️ Could not fully apply live profile: ${error.message}`);
+        logger.warn('Could not fully apply live profile: ' + error.message);
       });
     }
   }
@@ -314,183 +300,146 @@ class StreamerApp {
     const hint = document.getElementById('profileHint');
     const summary = document.getElementById('profileSummary');
     const activeProfile = document.getElementById('activeProfile');
-
-    if (hint) {
-      hint.textContent = profile.hint;
-    }
-    if (summary) {
-      summary.textContent = profile.summary;
-    }
-    if (activeProfile) {
-      activeProfile.textContent = profile.label;
-    }
+    if (hint) hint.textContent = profile.hint;
+    if (summary) summary.textContent = profile.summary;
+    if (activeProfile) activeProfile.textContent = profile.label;
   }
 
   setStatus(status, color = 'gray') {
-    try {
-      const badge = document.getElementById('status');
-      if (badge) {
-        badge.textContent = status;
-        badge.style.backgroundColor = color;
-      }
-      logger.debug(`📊 Status: ${status} (${color})`);
-    } catch (err) {
-      logger.error(`Failed to set status: ${err.message}`);
+    const badge = document.getElementById('status');
+    if (badge) {
+      badge.textContent = status;
+      badge.style.backgroundColor = color;
     }
   }
 
   async connect() {
-    try {
-      logger.info('═══════════════════════════════════════');
-      logger.info('📡 CONNECT INITIATED');
-      logger.info('═══════════════════════════════════════');
+    const serverUrlInput = document.getElementById('serverUrl');
+    const streamerNameInput = document.getElementById('streamerName');
 
-      const serverUrlInput = document.getElementById('serverUrl');
-      const streamerNameInput = document.getElementById('streamerName');
-
-      if (!serverUrlInput || !streamerNameInput) {
-        logger.error('❌ Input elements not found');
-        return;
-      }
-
-      const serverUrl = serverUrlInput.value.trim();
-      const streamerName = streamerNameInput.value.trim();
-      this.streamerName = streamerName;
-
-      logger.debug(`Server URL input: "${serverUrl}"`);
-      logger.debug(`Streamer name input: "${streamerName}"`);
-
-      if (!serverUrl || !streamerName) {
-        logger.error('❌ Missing server URL or streamer name');
-        alert('Please fill in all fields');
-        return;
-      }
-
-      this.setStatus('Connecting...', 'blue');
-      logger.info(`📡 Connecting to ${serverUrl} as "${streamerName}"`);
-
-      try {
-        logger.debug('🔌 Creating Socket.io connection...');
-        
-        this.socket = new SocketIOClient(serverUrl, {
-          reconnection: true,
-          reconnectionDelay: 1000,
-          reconnectionDelayMax: 5000,
-          reconnectionAttempts: 5
-        });
-
-        logger.debug('🔌 Socket.io instance created');
-
-        this.socket.on('connect', () => {
-          logger.info('═══════════════════════════════════════');
-          logger.info('✅ CONNECTED TO SERVER!');
-          logger.info('═══════════════════════════════════════');
-          this.setStatus('Connected', 'green');
-          logger.debug(`📤 Registering streamer: ${streamerName}`);
-          this.socket.emit('register-streamer', { name: streamerName });
-          this.showCapturePanel();
-          this.loadCaptureSources();
-        });
-
-        this.socket.on('connect_error', (error) => {
-          logger.error(`❌ Connection error: ${error.message || error}`);
-          this.setStatus('Connection Error', 'red');
-        });
-
-        this.socket.on('disconnect', (reason) => {
-          logger.warn(`⚠️ Disconnected: ${reason}`);
-          this.setStatus('Disconnected', 'red');
-          this.hideCapturePanel();
-          this.hideStreamPanel();
-        });
-
-        this.socket.on('viewer-joined', (data) => {
-          logger.info(`👁️ Viewer joined: ${data.viewerName || 'Unknown'}`);
-          this.handleViewerJoined(data);
-        });
-
-        this.socket.on('viewer-left', (data) => {
-          logger.info(`👋 Viewer left`);
-          this.handleViewerLeft(data);
-        });
-
-        this.socket.on('answer', (data) => {
-          logger.debug('📨 Received WebRTC answer');
-          this.handleAnswer(data);
-        });
-
-        this.socket.on('ice-candidate', (data) => {
-          logger.debug('❄️ Received ICE candidate');
-          this.handleIceCandidate(data);
-        });
-
-        this.socket.on('viewer-quality-report', (data) => {
-          this.handleViewerQualityReport(data);
-        });
-
-      } catch (socketErr) {
-        logger.error(`❌ Socket.io error: ${socketErr.message}`);
-        this.setStatus('Error', 'red');
-      }
-
-    } catch (error) {
-      logger.error(`❌ Connect error: ${error.message}`);
-      logger.debug(`Stack: ${error.stack}`);
-      this.setStatus('Error', 'red');
+    if (!serverUrlInput || !streamerNameInput) {
+      logger.error('Input elements not found');
+      return;
     }
+
+    const serverUrl = serverUrlInput.value.trim();
+    const streamerName = streamerNameInput.value.trim();
+    this.streamerName = streamerName;
+    this.serverUrl = serverUrl;
+
+    if (!serverUrl || !streamerName) {
+      logger.error('Missing server URL or streamer name');
+      alert('Please fill in all fields');
+      return;
+    }
+
+    // Close existing connection if any
+    if (this.socket) {
+      this.socket.close();
+      this.socket = null;
+    }
+
+    this.setStatus('Connecting...', 'blue');
+    logger.info('Connecting to ' + serverUrl + ' as "' + streamerName + '"');
+
+    this.socket = new SignalClient(serverUrl, {
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 15000,
+      reconnectionAttempts: 10
+    });
+
+    this.socket.on('connect', () => {
+      logger.info('CONNECTED TO SERVER');
+      this.setStatus('Connected', 'green');
+      this.socket.emit('register-streamer', { name: streamerName });
+      this.showCapturePanel();
+      this.loadCaptureSources();
+    });
+
+    this.socket.on('reconnecting', (info) => {
+      this.setStatus('Reconnecting (' + info.attempt + ')...', 'orange');
+    });
+
+    this.socket.on('reconnect_failed', () => {
+      this.setStatus('Connection Lost', 'red');
+      logger.error('Could not reconnect to server');
+    });
+
+    this.socket.on('connect_error', (error) => {
+      const msg = error && error.message ? error.message : String(error);
+      logger.error('Connection error: ' + msg);
+      this.setStatus('Connection Error', 'red');
+    });
+
+    this.socket.on('disconnect', () => {
+      logger.warn('Disconnected from server');
+      this.setStatus('Reconnecting...', 'orange');
+    });
+
+    this.socket.on('viewer-joined', (data) => {
+      logger.info('Viewer joined: ' + (data.viewerName || 'Unknown'));
+      this.handleViewerJoined(data);
+    });
+
+    this.socket.on('viewer-left', (data) => {
+      logger.info('Viewer left');
+      this.handleViewerLeft(data);
+    });
+
+    this.socket.on('answer', (data) => {
+      this.handleAnswer(data);
+    });
+
+    this.socket.on('ice-candidate', (data) => {
+      this.handleIceCandidate(data);
+    });
+
+    this.socket.on('viewer-quality-report', (data) => {
+      this.handleViewerQualityReport(data);
+    });
   }
 
   async loadCaptureSources() {
-    logger.info('📷 Loading capture sources...');
+    logger.info('Loading capture sources...');
     try {
       if (!window.electron) {
-        logger.error('❌ window.electron not available');
+        logger.error('window.electron not available');
         return;
       }
 
       const sources = await window.electron.getCaptureSources();
-      logger.info(`✅ Found ${sources.length} capture sources`);
-      
-      sources.forEach((s, i) => {
-        logger.debug(`  ${i + 1}. ${s.name}`);
-      });
+      logger.info('Found ' + sources.length + ' capture sources');
 
       const grid = document.getElementById('sourcesGrid');
-      if (!grid) {
-        logger.error('❌ sourcesGrid element not found');
-        return;
-      }
+      if (!grid) return;
 
       grid.innerHTML = '';
 
       sources.forEach(source => {
         const sourceEl = document.createElement('div');
         sourceEl.className = 'source-tile';
-        sourceEl.innerHTML = `
-          <img src="${source.thumbnail}" alt="${source.name}">
-          <p>${source.name}</p>
-          <button class="btn btn-small">Stream This</button>
-        `;
+        sourceEl.innerHTML =
+          '<img src="' + source.thumbnail + '" alt="' + source.name + '">' +
+          '<p>' + source.name + '</p>' +
+          '<button class="btn btn-small">Stream This</button>';
         sourceEl.querySelector('button').addEventListener('click', () => {
-          logger.info(`📺 Selected: ${source.name}`);
+          logger.info('Selected: ' + source.name);
           this.startStreaming(source.id, source.name);
         });
         grid.appendChild(sourceEl);
       });
     } catch (error) {
-      logger.error(`❌ Failed to load sources: ${error.message}`);
-      logger.debug(`Stack: ${error.stack}`);
+      logger.error('Failed to load sources: ' + error.message);
     }
   }
 
   async startStreaming(sourceId, sourceName) {
     try {
-      logger.info(`🎥 Starting stream: ${sourceName}`);
-      logger.debug(`Using source ID: ${sourceId}`);
+      logger.info('Starting stream: ' + sourceName);
 
       const stream = await this.captureSourceStream(sourceId);
 
-      logger.info('✅ Display media obtained');
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.contentHint = 'motion';
@@ -500,16 +449,16 @@ class StreamerApp {
           height: settings.height || 720,
           frameRate: settings.frameRate || 60
         };
-        logger.info(`📐 ${settings.width}x${settings.height} @ ${settings.frameRate}fps`);
-        logger.info(`⚙️ Active profile: ${this.getActiveQualityProfile().label}`);
+        logger.info('Capture: ' + settings.width + 'x' + settings.height + ' @ ' + Math.round(settings.frameRate || 60) + 'fps');
+        logger.info('Profile: ' + this.getActiveQualityProfile().label);
       }
 
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length > 0) {
-        logger.info(`🔊 Audio capture active (${audioTracks.length} track)`);
+        logger.info('Audio capture active (' + audioTracks.length + ' track)');
         this.updateAudioStatus('Live');
       } else {
-        logger.warn('⚠️ Audio capture unavailable for this source');
+        logger.warn('Audio capture unavailable for this source');
         this.updateAudioStatus(this.includeAudio ? 'Unavailable' : 'Off');
       }
 
@@ -520,19 +469,17 @@ class StreamerApp {
       this.updateStatsDisplay(null, null);
       this.hideCapturePanel();
 
-      // Track when stream ends
       this.localStream.getTracks().forEach(track => {
         track.onended = () => {
-          logger.warn('⚠️ Stream ended');
+          logger.warn('Stream track ended');
           this.stopStreaming();
         };
       });
 
-      logger.info('✅ Stream ready - waiting for viewers to connect');
+      logger.info('Stream ready - waiting for viewers');
 
     } catch (error) {
-      logger.error(`❌ Failed to start stream: ${error.message}`);
-      logger.debug(`Error: ${error.name}`);
+      logger.error('Failed to start stream: ' + error.message);
       this.setStatus('Stream Error', 'red');
     }
   }
@@ -550,14 +497,11 @@ class StreamerApp {
     };
 
     if (!this.includeAudio) {
-      return navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: videoConstraints
-      });
+      return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
     }
 
     try {
-      logger.info('🔊 Attempting to capture source audio');
+      logger.info('Attempting audio + video capture');
       return await navigator.mediaDevices.getUserMedia({
         audio: {
           mandatory: {
@@ -568,57 +512,57 @@ class StreamerApp {
         video: videoConstraints
       });
     } catch (error) {
-      logger.warn(`⚠️ Audio capture failed, falling back to video-only: ${error.message}`);
-      return navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: videoConstraints
-      });
+      logger.warn('Audio capture failed, falling back to video-only: ' + error.message);
+      return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
     }
   }
 
   handleViewerJoined(data) {
     const { viewerId, viewerName } = data;
-    logger.info(`🤝 Viewer connection established: ${viewerName}`);
+    logger.info('Setting up peer connection for: ' + viewerName);
 
     if (!this.localStream) {
-      logger.error('❌ Cannot create peer connection before stream is ready');
+      logger.error('Cannot create peer before stream is ready');
       return;
     }
 
     try {
-      const peerConnection = new RTCPeerConnection({
-        iceServers: [
-          { urls: ['stun:stun.l.google.com:19302'] },
-          { urls: ['stun:stun1.l.google.com:19302'] }
-        ]
+      const pc = new RTCPeerConnection({
+        iceServers: ICE_SERVERS,
+        bundlePolicy: 'max-bundle',
+        sdpSemantics: 'unified-plan'
       });
 
       this.localStream.getTracks().forEach((track) => {
-        const sender = peerConnection.addTrack(track, this.localStream);
+        const sender = pc.addTrack(track, this.localStream);
         if (track.kind === 'video') {
           this.configureVideoSender(sender, viewerName);
         }
       });
 
-      peerConnection.onicecandidate = (event) => {
-        if (!event.candidate) {
-          return;
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          this.socket.emit('ice-candidate', { targetId: viewerId, candidate: event.candidate });
         }
-
-        this.socket.emit('ice-candidate', {
-          targetId: viewerId,
-          candidate: event.candidate
-        });
       };
 
-      peerConnection.onconnectionstatechange = () => {
-        logger.info(`🔗 Peer ${viewerName} state: ${peerConnection.connectionState}`);
-        if (
-          peerConnection.connectionState === 'failed' ||
-          peerConnection.connectionState === 'closed' ||
-          peerConnection.connectionState === 'disconnected'
-        ) {
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        logger.info('Peer ' + viewerName + ' state: ' + state);
+
+        if (state === 'failed') {
+          // Attempt ICE restart before dropping
+          this.attemptIceRestart(viewerId);
+        } else if (state === 'closed') {
           this.removePeer(viewerId);
+        } else if (state === 'disconnected') {
+          // Give it a few seconds to recover before acting
+          setTimeout(() => {
+            const peer = this.peers.get(viewerId);
+            if (peer && peer.connection.connectionState === 'disconnected') {
+              this.attemptIceRestart(viewerId);
+            }
+          }, 3000);
         }
       };
 
@@ -626,29 +570,50 @@ class StreamerApp {
         id: viewerId,
         name: viewerName,
         status: 'connecting',
-        connection: peerConnection,
+        connection: pc,
         qualityLevel: 0,
         goodReports: 0,
         lastReportAt: 0,
-        videoSender: peerConnection.getSenders().find((item) => item.track?.kind === 'video') || null
+        iceRestarts: 0,
+        videoSender: pc.getSenders().find((s) => s.track?.kind === 'video') || null
       });
       this.updateViewersList();
       this.ensureStatsCollection();
 
       this.createAndSendOffer(viewerId).catch((error) => {
-        logger.error(`❌ Offer creation failed for ${viewerName}: ${error.message}`);
+        logger.error('Offer creation failed for ' + viewerName + ': ' + error.message);
       });
     } catch (error) {
-      logger.error(`❌ Viewer join failed: ${error.message}`);
+      logger.error('Viewer join failed: ' + error.message);
+    }
+  }
+
+  async attemptIceRestart(viewerId) {
+    const peer = this.peers.get(viewerId);
+    if (!peer || !peer.connection) return;
+
+    if (peer.iceRestarts >= 2) {
+      logger.warn('Max ICE restarts reached for ' + peer.name + ', dropping peer');
+      this.removePeer(viewerId);
+      return;
+    }
+
+    peer.iceRestarts++;
+    logger.info('Attempting ICE restart for ' + peer.name + ' (attempt ' + peer.iceRestarts + ')');
+
+    try {
+      const offer = await peer.connection.createOffer({ iceRestart: true });
+      await peer.connection.setLocalDescription(offer);
+      this.socket.emit('offer', { viewerId, offer: peer.connection.localDescription });
+    } catch (error) {
+      logger.error('ICE restart failed for ' + peer.name + ': ' + error.message);
+      this.removePeer(viewerId);
     }
   }
 
   async createAndSendOffer(viewerId) {
     const peer = this.peers.get(viewerId);
-    if (!peer || !peer.connection) {
-      logger.error(`❌ Missing peer connection for viewer ${viewerId}`);
-      return;
-    }
+    if (!peer || !peer.connection) return;
 
     const offer = await peer.connection.createOffer({
       offerToReceiveAudio: false,
@@ -659,21 +624,16 @@ class StreamerApp {
     peer.status = 'offer-sent';
     this.updateViewersList();
 
-    logger.info(`📤 Sending offer to ${peer.name}`);
-    this.socket.emit('offer', {
-      viewerId,
-      offer: peer.connection.localDescription
-    });
+    logger.info('Sending offer to ' + peer.name);
+    this.socket.emit('offer', { viewerId, offer: peer.connection.localDescription });
   }
 
   async configureVideoSender(sender, viewerName) {
-    if (!sender) {
-      return;
-    }
+    if (!sender) return;
 
     try {
       const profile = this.getActiveQualityProfile();
-      const peer = Array.from(this.peers.values()).find((entry) => entry.videoSender === sender || entry.name === viewerName);
+      const peer = Array.from(this.peers.values()).find((e) => e.videoSender === sender || e.name === viewerName);
       const adaptation = this.adaptationLevels[peer?.qualityLevel || 0] || this.adaptationLevels[0];
       const sourceWidth = this.captureProfile?.width || 1280;
       const targetWidth = Math.min(sourceWidth, profile.maxWidth);
@@ -685,6 +645,9 @@ class StreamerApp {
       parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
       parameters.encodings[0].maxBitrate = Math.round(profile.maxBitrate * adaptation.bitrateScale);
       parameters.encodings[0].maxFramerate = profile.maxFrameRate;
+      parameters.encodings[0].priority = 'high';
+      parameters.encodings[0].networkPriority = 'high';
+
       if (scaleResolutionDownBy > 1) {
         parameters.encodings[0].scaleResolutionDownBy = scaleResolutionDownBy;
       } else {
@@ -694,40 +657,44 @@ class StreamerApp {
       await sender.setParameters(parameters);
 
       logger.info(
-        `⚙️ Sender tuned for ${viewerName}: ${profile.label}/${adaptation.label}, ${targetWidth}w max, ${profile.maxFrameRate}fps target, ${(parameters.encodings[0].maxBitrate / 1000000).toFixed(1)} Mbps cap`
+        'Sender tuned [' + viewerName + ']: ' + profile.label + '/' + adaptation.label +
+        ', ' + targetWidth + 'w max, ' + profile.maxFrameRate + 'fps, ' +
+        (parameters.encodings[0].maxBitrate / 1000000).toFixed(1) + ' Mbps cap'
       );
     } catch (error) {
-      logger.warn(`⚠️ Could not tune video sender for ${viewerName}: ${error.message}`);
+      logger.warn('Could not tune sender for ' + viewerName + ': ' + error.message);
     }
   }
 
   async handleViewerQualityReport(data) {
     const { viewerId, fps, jitterMs } = data;
     const peer = this.peers.get(viewerId);
-    if (!peer || !peer.videoSender) {
-      return;
-    }
+    if (!peer || !peer.videoSender) return;
 
     const now = Date.now();
-    if (now - peer.lastReportAt < 900) {
-      return;
-    }
+    if (now - peer.lastReportAt < 900) return;
     peer.lastReportAt = now;
 
-    if (fps != null && fps < 20 && peer.qualityLevel < this.adaptationLevels.length - 1) {
+    const profile = this.getActiveQualityProfile();
+    const targetFps = profile.maxFrameRate;
+    // Relative thresholds: downgrade if below 40% of target, upgrade if above 80%
+    const downgradeThreshold = targetFps * 0.4;
+    const upgradeThreshold = targetFps * 0.8;
+
+    if (fps != null && fps < downgradeThreshold && peer.qualityLevel < this.adaptationLevels.length - 1) {
       peer.qualityLevel += 1;
       peer.goodReports = 0;
-      logger.warn(`📉 ${peer.name} is falling behind (${fps} fps, ${Math.round(jitterMs || 0)} ms jitter). Lowering quality.`);
+      logger.warn(peer.name + ' falling behind (' + fps + ' fps, ' + Math.round(jitterMs || 0) + 'ms jitter). Lowering quality.');
       await this.configureVideoSender(peer.videoSender, peer.name);
       return;
     }
 
-    if (fps != null && fps > 48 && (jitterMs || 0) < 80) {
+    if (fps != null && fps > upgradeThreshold && (jitterMs || 0) < 80) {
       peer.goodReports += 1;
       if (peer.goodReports >= 5 && peer.qualityLevel > 0) {
         peer.qualityLevel -= 1;
         peer.goodReports = 0;
-        logger.info(`📈 ${peer.name} recovered (${fps} fps). Raising quality.`);
+        logger.info(peer.name + ' recovered (' + fps + ' fps). Raising quality.');
         await this.configureVideoSender(peer.videoSender, peer.name);
       }
       return;
@@ -747,14 +714,14 @@ class StreamerApp {
           height: { max: profile.maxHeight },
           frameRate: { max: profile.maxFrameRate }
         });
-        logger.info(`🎚️ Applied capture constraints for ${profile.label}`);
+        logger.info('Applied capture constraints for ' + profile.label);
       } catch (error) {
-        logger.warn(`⚠️ Could not apply capture constraints: ${error.message}`);
+        logger.warn('Could not apply capture constraints: ' + error.message);
       }
     }
 
     for (const peer of this.peers.values()) {
-      const sender = peer.connection?.getSenders?.().find((item) => item.track?.kind === 'video');
+      const sender = peer.connection?.getSenders?.().find((s) => s.track?.kind === 'video');
       await this.configureVideoSender(sender, peer.name);
     }
   }
@@ -763,47 +730,41 @@ class StreamerApp {
     const { viewerId, answer } = data;
     const peer = this.peers.get(viewerId);
     if (!peer || !peer.connection) {
-      logger.warn(`⚠️ Received answer for unknown viewer ${viewerId}`);
+      logger.warn('Answer for unknown viewer ' + viewerId);
       return;
     }
 
     try {
       await peer.connection.setRemoteDescription(new RTCSessionDescription(answer));
       peer.status = 'connected';
+      peer.iceRestarts = 0; // Reset restart counter on successful connection
       this.updateViewersList();
       this.ensureStatsCollection();
-      logger.info(`✅ Remote answer applied for ${peer.name}`);
+      logger.info('Remote answer applied for ' + peer.name);
     } catch (error) {
-      logger.error(`❌ Failed to apply answer for ${peer.name}: ${error.message}`);
+      logger.error('Failed to apply answer for ' + peer.name + ': ' + error.message);
     }
   }
 
   async handleIceCandidate(data) {
     const { from, candidate } = data;
     const peer = this.peers.get(from);
-    if (!peer || !peer.connection || !candidate) {
-      logger.warn(`⚠️ ICE candidate ignored for unknown viewer ${from}`);
-      return;
-    }
+    if (!peer || !peer.connection || !candidate) return;
 
     try {
       await peer.connection.addIceCandidate(new RTCIceCandidate(candidate));
-      logger.debug(`✅ ICE candidate added for ${peer.name}`);
     } catch (error) {
-      logger.error(`❌ Failed to add ICE candidate for ${peer.name}: ${error.message}`);
+      logger.error('Failed to add ICE candidate for ' + peer.name + ': ' + error.message);
     }
   }
 
   handleViewerLeft(data) {
-    const { viewerId } = data;
-    this.removePeer(viewerId);
+    this.removePeer(data.viewerId);
   }
 
   removePeer(viewerId) {
     const peer = this.peers.get(viewerId);
-    if (!peer) {
-      return;
-    }
+    if (!peer) return;
 
     if (peer.connection) {
       peer.connection.onicecandidate = null;
@@ -824,10 +785,7 @@ class StreamerApp {
   updateViewersList() {
     const count = this.peers.size;
     const viewerCount = document.getElementById('viewerCount');
-    if (viewerCount) {
-      viewerCount.textContent = count;
-    }
-    logger.debug(`👥 Viewers: ${count}`);
+    if (viewerCount) viewerCount.textContent = count;
 
     const list = document.getElementById('viewersList');
     if (list) {
@@ -835,14 +793,14 @@ class StreamerApp {
       this.peers.forEach((peer, viewerId) => {
         const item = document.createElement('div');
         item.className = 'viewer-item';
-        item.innerHTML = `<span>${peer.name || viewerId.substring(0, 8)} (${peer.status || 'idle'})</span>`;
+        item.innerHTML = '<span>' + (peer.name || viewerId.substring(0, 8)) + ' (' + (peer.status || 'idle') + ')</span>';
         list.appendChild(item);
       });
     }
   }
 
   stopStreaming() {
-    logger.info('🛑 Stopping stream...');
+    logger.info('Stopping stream...');
     if (this.localStream) {
       this.localStream.getTracks().forEach(track => track.stop());
       this.localStream = null;
@@ -857,35 +815,28 @@ class StreamerApp {
       this.removePeer(viewerId);
     });
     this.peers.clear();
-    logger.info('✅ Stream stopped');
+    logger.info('Stream stopped');
 
     this.isBroadcasting = false;
     this.hideStreamPanel();
     this.showCapturePanel();
   }
 
-  updateStreamStatus(status, color) {
-    const statusEl = document.getElementById('streamStatus');
-    if (statusEl) {
-      statusEl.textContent = status;
-    }
+  updateStreamStatus(status) {
+    const el = document.getElementById('streamStatus');
+    if (el) el.textContent = status;
   }
 
   updateAudioStatus(status) {
-    const audioEl = document.getElementById('audioStatus');
-    if (audioEl) {
-      audioEl.textContent = status;
-    }
+    const el = document.getElementById('audioStatus');
+    if (el) el.textContent = status;
   }
 
   ensureStatsCollection() {
-    if (this.statsInterval || this.peers.size === 0) {
-      return;
-    }
-
+    if (this.statsInterval || this.peers.size === 0) return;
     this.statsInterval = setInterval(() => {
       this.collectOutboundStats().catch((error) => {
-        logger.error(`❌ Error collecting outbound stats: ${error.message}`);
+        logger.error('Stats collection error: ' + error.message);
       });
     }, 1000);
   }
@@ -902,15 +853,11 @@ class StreamerApp {
     let fpsSamples = [];
 
     for (const [viewerId, peer] of this.peers.entries()) {
-      if (!peer.connection) {
-        continue;
-      }
+      if (!peer.connection) continue;
 
       const stats = await peer.connection.getStats();
       stats.forEach((report) => {
-        if (report.type !== 'outbound-rtp' || report.kind !== 'video') {
-          return;
-        }
+        if (report.type !== 'outbound-rtp' || report.kind !== 'video') return;
 
         const previous = this.peerSnapshots.get(viewerId) || {
           timestamp: report.timestamp,
@@ -918,18 +865,12 @@ class StreamerApp {
           framesEncoded: report.framesEncoded || 0
         };
 
-        const elapsedSeconds = (report.timestamp - previous.timestamp) / 1000;
-        if (elapsedSeconds > 0) {
+        const elapsed = (report.timestamp - previous.timestamp) / 1000;
+        if (elapsed > 0) {
           const bytesDelta = (report.bytesSent || 0) - previous.bytesSent;
-          const framesDelta = (report.framesEncoded || 0) - previous.framesEncoded;
-
-          if (bytesDelta >= 0) {
-            totalBitrateMbps += (bytesDelta * 8) / elapsedSeconds / 1000000;
-          }
-
-          if (framesDelta >= 0) {
-            fpsSamples.push(framesDelta / elapsedSeconds);
-          }
+          const frameDelta = (report.framesEncoded || 0) - previous.framesEncoded;
+          if (bytesDelta >= 0) totalBitrateMbps += (bytesDelta * 8) / elapsed / 1000000;
+          if (frameDelta >= 0) fpsSamples.push(frameDelta / elapsed);
         }
 
         this.peerSnapshots.set(viewerId, {
@@ -940,89 +881,70 @@ class StreamerApp {
       });
     }
 
-    const averageFps = fpsSamples.length > 0
-      ? fpsSamples.reduce((sum, value) => sum + value, 0) / fpsSamples.length
+    const avgFps = fpsSamples.length > 0
+      ? fpsSamples.reduce((sum, v) => sum + v, 0) / fpsSamples.length
       : null;
 
-    this.updateStatsDisplay(totalBitrateMbps, averageFps);
+    this.updateStatsDisplay(totalBitrateMbps, avgFps);
   }
 
   updateStatsDisplay(bitrateMbps, fps) {
     const bitrateEl = document.getElementById('bitrate');
     const fpsEl = document.getElementById('fps');
-
-    if (bitrateEl) {
-      bitrateEl.textContent = bitrateMbps == null ? '-- Mbps' : `${bitrateMbps.toFixed(2)} Mbps`;
-    }
-
-    if (fpsEl) {
-      fpsEl.textContent = fps == null ? '--' : `${Math.round(fps)}`;
-    }
+    if (bitrateEl) bitrateEl.textContent = bitrateMbps == null ? '-- Mbps' : bitrateMbps.toFixed(2) + ' Mbps';
+    if (fpsEl) fpsEl.textContent = fps == null ? '--' : String(Math.round(fps));
   }
 
   showCapturePanel() {
     const setupPanel = document.getElementById('setupPanel');
     const capturePanel = document.getElementById('capturePanel');
     const streamPanel = document.getElementById('streamPanel');
-    
     if (setupPanel) setupPanel.style.display = 'block';
     if (capturePanel) capturePanel.style.display = 'block';
     if (streamPanel) streamPanel.style.display = 'none';
   }
 
   hideCapturePanel() {
-    const capturePanel = document.getElementById('capturePanel');
-    if (capturePanel) capturePanel.style.display = 'none';
+    const el = document.getElementById('capturePanel');
+    if (el) el.style.display = 'none';
   }
 
   showStreamPanel() {
     const setupPanel = document.getElementById('setupPanel');
     const capturePanel = document.getElementById('capturePanel');
     const streamPanel = document.getElementById('streamPanel');
-    
     if (setupPanel) setupPanel.style.display = 'none';
     if (capturePanel) capturePanel.style.display = 'none';
     if (streamPanel) streamPanel.style.display = 'block';
   }
 
   hideStreamPanel() {
-    const streamPanel = document.getElementById('streamPanel');
-    if (streamPanel) streamPanel.style.display = 'none';
+    const el = document.getElementById('streamPanel');
+    if (el) el.style.display = 'none';
   }
 }
 
 // ============================================
 // INITIALIZATION
 // ============================================
-
-console.log('[INIT] Script loading...');
-
 document.addEventListener('DOMContentLoaded', () => {
-  console.log('[INIT] DOM ready');
-  logger.info('📄 DOM loaded, initializing app...');
-  
+  logger.info('DOM loaded, initializing...');
   try {
     window.app = new StreamerApp();
-    logger.info('🎉 App ready! You can now connect.');
+    logger.info('App ready');
   } catch (err) {
-    console.error('[INIT] App initialization failed:', err);
-    logger.error(`❌ Init failed: ${err.message}`);
+    console.error('[INIT] Failed:', err);
+    logger.error('Init failed: ' + err.message);
   }
 });
 
-// Fallback if DOM already loaded
-if (document.readyState === 'loading') {
-  console.log('[INIT] Document still loading, waiting for DOMContentLoaded');
-} else {
-  console.log('[INIT] Document already loaded, initializing immediately');
+if (document.readyState !== 'loading' && !window.app) {
   setTimeout(() => {
-    logger.info('📄 Late init, creating app...');
     if (!window.app) {
       window.app = new StreamerApp();
-      logger.info('🎉 App created!');
+      logger.info('App created (late init)');
     }
   }, 100);
 }
 
-// Expose logger globally
 window.logger = logger;

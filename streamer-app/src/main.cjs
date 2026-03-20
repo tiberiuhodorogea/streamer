@@ -3,6 +3,7 @@ const path = require('path');
 
 let mainWindow;
 const APP_CAPTURE_NAMES = new Set(['Streamer Studio', 'P2P Stream - Streamer']);
+const SHOULD_OPEN_DEVTOOLS = process.env.STREAMER_DEVTOOLS === '1';
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({
@@ -31,7 +32,9 @@ const createWindow = () => {
 
   const htmlPath = path.join(__dirname, 'ui', 'index.html');
   mainWindow.loadFile(htmlPath);
-  mainWindow.webContents.openDevTools();
+  if (SHOULD_OPEN_DEVTOOLS) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
 };
 
 app.on('ready', createWindow);

@@ -7,6 +7,7 @@ const __dirname = dirname(__filename);
 
 let mainWindow;
 let streamerSocket = null;
+const SHOULD_OPEN_DEVTOOLS = process.env.STREAMER_DEVTOOLS === '1';
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({
@@ -22,7 +23,9 @@ const createWindow = () => {
   });
 
   mainWindow.loadFile(join(__dirname, 'ui', 'index.html'));
-  mainWindow.webContents.openDevTools();
+  if (SHOULD_OPEN_DEVTOOLS) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
 };
 
 app.on('ready', createWindow);

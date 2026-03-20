@@ -518,7 +518,8 @@ function handleViewerQualityReport(clientId, data) {
     ' fps=' + data.fps +
     ' bitrate=' + data.bitrateMbps + 'Mbps' +
     ' res=' + data.frameWidth + 'x' + data.frameHeight +
-    ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms'
+    ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms' +
+    ' loss=' + (data.lossRate != null ? (data.lossRate * 100).toFixed(1) + '%' : '--')
   );
 
   send(room.streamer.ws, 'viewer-quality-report', {
@@ -528,6 +529,7 @@ function handleViewerQualityReport(clientId, data) {
     frameWidth: data.frameWidth,
     frameHeight: data.frameHeight,
     jitterMs: data.jitterMs,
+    lossRate: data.lossRate,
   });
 }
 

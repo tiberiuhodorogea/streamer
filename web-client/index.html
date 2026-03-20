@@ -12,16 +12,18 @@
 </head>
 <body>
   <div class="container">
-    <!-- Header -->
-    <header>
-      <h1>🎮 P2P Stream - Viewer</h1>
+    <header class="app-header">
+      <div class="header-copy">
+        <span class="eyebrow">Viewer Deck</span>
+        <h1>Private Stream Monitor</h1>
+        <p>Fullscreen watching with adaptive telemetry and fast reconnect behavior.</p>
+      </div>
       <div class="status-badge" id="status">Disconnected</div>
     </header>
 
     <main>
-      <!-- Connection Setup -->
       <section class="setup-panel" id="setupPanel">
-        <h2>Connect to Stream</h2>
+        <h2>Connect</h2>
         <div class="form-group">
           <label>Server URL:</label>
           <input type="text" id="serverUrl" value="ws://localhost:4000" placeholder="ws://localhost:4000">
@@ -33,7 +35,6 @@
         <button id="connectBtn" class="btn btn-primary">Connect to Server</button>
       </section>
 
-      <!-- Stream Selection -->
       <section class="streams-panel" id="streamsPanel" style="display: none;">
         <h2>Available Streams</h2>
         <div class="streams-list" id="streamsList">
@@ -42,7 +43,6 @@
         <button id="refreshStreamsBtn" class="btn btn-secondary">Refresh</button>
       </section>
 
-      <!-- Video Player -->
       <section class="player-panel" id="playerPanel" style="display: none;">
         <h2>Now Watching</h2>
         <div class="player-container">
@@ -95,14 +95,13 @@
         <div class="debug-console" id="debugConsole"></div>
       </section>
     </main>
+  </div>
 
-    <!-- Error Display -->
-    <div id="errorModal" class="modal" style="display: none;">
-      <div class="modal-content">
-        <h3>Error</h3>
-        <p id="errorMessage"></p>
-        <button onclick="document.getElementById('errorModal').style.display='none'" class="btn btn-primary">Dismiss</button>
-      </div>
+  <div id="errorModal" class="modal" style="display: none;">
+    <div class="modal-content">
+      <h3>Connection Issue</h3>
+      <p id="errorMessage"></p>
+      <button id="dismissErrorBtn" class="btn btn-primary">Dismiss</button>
     </div>
   </div>
 

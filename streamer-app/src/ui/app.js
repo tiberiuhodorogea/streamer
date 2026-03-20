@@ -204,36 +204,18 @@ const logger = new DebugLogger();
 // QUALITY PROFILES
 // ============================================
 const QUALITY_PROFILES = {
-  performance: {
-    label: 'Performance',
-    hint: 'Lower resolution, smooth framerate',
-    summary: '720p / 60 fps / 8 Mbps cap',
-    maxWidth: 1280,
-    maxHeight: 720,
-    maxFrameRate: 60,
-    maxBitrate: 8_000_000,
-  },
-  balanced: {
-    label: 'Balanced',
-    hint: '1080p with conservative bitrate',
-    summary: '1080p / 60 fps / 12 Mbps cap',
-    maxWidth: 1920,
-    maxHeight: 1080,
-    maxFrameRate: 60,
-    maxBitrate: 12_000_000,
-  },
   quality: {
-    label: 'Quality',
-    hint: 'Sharp 1080p, high bitrate',
-    summary: '1080p / 60 fps / 20 Mbps cap',
+    label: 'Quality 1080p',
+    hint: 'Full HD target with adaptive headroom for cleaner motion',
+    summary: '1080p / 60 fps / 18 Mbps cap',
     maxWidth: 1920,
     maxHeight: 1080,
     maxFrameRate: 60,
-    maxBitrate: 20_000_000,
+    maxBitrate: 18_000_000,
   },
   ultra: {
-    label: 'Ultra (2K)',
-    hint: 'Maximum resolution and bitrate',
+    label: 'Ultra 2K',
+    hint: 'Maximum resolution with the same adaptive quality stack',
     summary: '2K (1440p) / 60 fps / 20 Mbps cap',
     maxWidth: 2560,
     maxHeight: 1440,
@@ -241,6 +223,294 @@ const QUALITY_PROFILES = {
     maxBitrate: 20_000_000,
   }
 };
+
+// ============================================
+// DEGRADATION TIERS
+// Combines bitrate, FPS, and resolution scaling for optimal quality at each level.
+// Order: first cut bitrate → then halve FPS → then scale down resolution.
+// ============================================
+const DEGRADATION_TIERS = [
+  { bitratePct: 1.00, scaleDown: 1.0, fpsFraction: 1.0, label: 'MAX'  },  // full profile quality
+  { bitratePct: 0.75, scaleDown: 1.0, fpsFraction: 1.0, label: 'HIGH' },  // mild bitrate cut, encoder absorbs
+  { bitratePct: 0.55, scaleDown: 1.0, fpsFraction: 0.5, label: 'MID'  },  // halve FPS → doubles per-frame budget
+  { bitratePct: 0.40, scaleDown: 1.5, fpsFraction: 0.5, label: 'LOW'  },  // scale down res → crisper pixels
+  { bitratePct: 0.25, scaleDown: 2.0, fpsFraction: 0.5, label: 'MIN'  },  // heavy downscale, last resort
+];
+
+// ============================================
+// ADAPTIVE QUALITY CONTROLLER
+// Navigates tiers based on viewer health signals.
+// Degrades fast (2s cooldown), recovers aggressively (3s of good health).
+// ============================================
+class AdaptiveQualityController {
+  constructor(streamerApp) {
+    this.app = streamerApp;
+    this.enabled = true;
+    this.tierIndex = 0;               // current tier (0 = max quality)
+    this.profileMaxBitrate = 0;
+    this.profileMaxFps = 60;
+    this.floor = 1_500_000;           // absolute minimum bitrate
+
+    // Viewer health tracking
+    this.viewerHealth = new Map();
+
+    // Timing
+    this.lastDegradeTime = 0;
+    this.lastRecoverTime = 0;
+    this.degradeCooldownMs = 2000;    // react fast to congestion
+    this.recoverCooldownMs = 3000;    // recover aggressively
+    this.goodHealthStart = 0;
+    this.recoverWaitMs = 3000;        // 3s good health → step up
+
+    // Thresholds — loss is SECONDARY (some connections have baseline loss)
+    this.jitterWarnMs = 35;
+    this.jitterCriticalMs = 50;
+    this.lossWarnRate = 0.05;         // raised to 5% — Tailscale/DERP can have 2-4% baseline
+    this.lossCriticalRate = 0.10;     // >10% packet loss = critical
+  }
+
+  get currentTier() { return DEGRADATION_TIERS[this.tierIndex]; }
+
+  get effectiveBitrate() {
+    return Math.max(this.floor, Math.round(this.profileMaxBitrate * this.currentTier.bitratePct));
+  }
+
+  get effectiveFps() {
+    return Math.max(15, Math.round(this.profileMaxFps * this.currentTier.fpsFraction));
+  }
+
+  setProfile(bitrate, fps) {
+    this.profileMaxBitrate = bitrate;
+    this.profileMaxFps = fps || 60;
+    this.tierIndex = 0; // reset to max quality on profile change
+    this._applyTier();
+  }
+
+  onViewerReport(viewerId, report) {
+    if (!this.enabled) return;
+
+    let health = this.viewerHealth.get(viewerId);
+    if (!health) {
+      health = {
+        fpsSamples: [],
+        jitterSamples: [],
+        lossRate: 0,
+        baselineFps: 0,
+        baselineSamples: 0,
+        bitrateMbps: 0,
+      };
+      this.viewerHealth.set(viewerId, health);
+    }
+
+    const fps = report.fps || 0;
+    health.fpsSamples.push(fps);
+    if (health.fpsSamples.length > 8) health.fpsSamples.shift();
+
+    health.jitterSamples.push(report.jitterMs || 0);
+    if (health.jitterSamples.length > 8) health.jitterSamples.shift();
+
+    health.lossRate = report.lossRate || 0;
+    health.bitrateMbps = report.bitrateMbps || 0;
+
+    // Learn baseline FPS via EMA (only healthy samples > 5fps)
+    if (fps > 5) {
+      if (health.baselineSamples < 5) {
+        health.baselineFps = ((health.baselineFps * health.baselineSamples) + fps) / (health.baselineSamples + 1);
+        health.baselineSamples++;
+      } else {
+        health.baselineFps = health.baselineFps * 0.9 + fps * 0.1;
+      }
+    }
+  }
+
+  removeViewer(viewerId) {
+    this.viewerHealth.delete(viewerId);
+  }
+
+  // Called every stats tick (~1s)
+  evaluate() {
+    if (!this.enabled || this.viewerHealth.size === 0) return;
+
+    const now = Date.now();
+    const assessment = this._assessHealth();
+
+    // Detailed per-tick diagnostics (every tick for tuning)
+    if (!this._evalCounter) this._evalCounter = 0;
+    this._evalCounter++;
+    if (this._evalCounter % 3 === 0) { // every 3s to avoid spam
+      let diag = '[ABR:TICK] tier=' + this.currentTier.label + ' health=' + assessment;
+      for (const [viewerId, health] of this.viewerHealth) {
+        const recent = health.fpsSamples.slice(-3);
+        const recentAvg = recent.length ? (recent.reduce((a, b) => a + b, 0) / recent.length).toFixed(1) : '?';
+        const baseline = health.baselineSamples >= 3 ? health.baselineFps.toFixed(1) : '(learning)';
+        const jRecent = health.jitterSamples.slice(-3);
+        const jAvg = jRecent.length ? (jRecent.reduce((a, b) => a + b, 0) / jRecent.length).toFixed(1) : '?';
+        diag += ' | v=' + viewerId.substring(0, 6) + ' fps=' + recentAvg + '/' + baseline + ' jitter=' + jAvg + 'ms loss=' + (health.lossRate * 100).toFixed(1) + '%';
+      }
+      if (this.goodHealthStart) {
+        diag += ' | goodFor=' + ((now - this.goodHealthStart) / 1000).toFixed(1) + 's';
+      }
+      logger.debug(diag);
+    }
+
+    if (assessment === 'source-stall') {
+      // Source stopped producing — don't degrade, just log
+      if (this._evalCounter % 3 === 0) {
+        logger.warn('[ABR] Source stall detected (all viewers 0fps/0bps) — holding tier ' + this.currentTier.label);
+      }
+    } else if (assessment === 'critical') {
+      if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
+        this._stepDown(2); // emergency: skip 2 tiers
+      }
+    } else if (assessment === 'warning') {
+      if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
+        this._stepDown(1);
+      }
+    } else if (assessment === 'good') {
+      if (this.tierIndex > 0) {
+        if (!this.goodHealthStart) {
+          this.goodHealthStart = now;
+        } else if (now - this.goodHealthStart >= this.recoverWaitMs &&
+                   now - this.lastRecoverTime >= this.recoverCooldownMs) {
+          // Gate: only step up if actual bitrate can support the next tier
+          const nextTier = DEGRADATION_TIERS[this.tierIndex - 1];
+          const neededMbps = (this.profileMaxBitrate * nextTier.bitratePct) / 1e6;
+          const currentMbps = this._getMinViewerBitrate();
+          if (currentMbps >= neededMbps * 0.5) {
+            // Viewers are delivering at least 50% of next tier's bitrate — safe to step up
+            this._stepUp(1);
+          } else {
+            // Not enough bandwidth headroom — hold position, don't reset goodHealthStart
+            if (this._evalCounter % 3 === 0) {
+              logger.debug('[ABR] Recovery gated: need ' + neededMbps.toFixed(1) + 'Mbps, actual=' + currentMbps.toFixed(1) + 'Mbps');
+            }
+          }
+        }
+      } else {
+        this.goodHealthStart = 0;
+      }
+    }
+  }
+
+  _assessHealth() {
+    let worstJitter = 0;
+    let worstLoss = 0;
+    let hasZeroFps = false;
+    let hasFpsCrash = false;
+    let hasFpsDrop = false;
+    let allZeroBitrate = true;  // source-freeze detection
+    let viewerCount = 0;
+
+    for (const [, health] of this.viewerHealth) {
+      if (health.fpsSamples.length < 2) continue;
+      viewerCount++;
+
+      const recent = health.fpsSamples.slice(-3);
+      const recentAvg = recent.reduce((a, b) => a + b, 0) / recent.length;
+      const baseline = health.baselineSamples >= 3 ? health.baselineFps : recentAvg;
+      const avgJitter = health.jitterSamples.slice(-3).reduce((a, b) => a + b, 0) / Math.min(health.jitterSamples.length, 3);
+
+      if (recent.some(f => f === 0)) hasZeroFps = true;
+      if (baseline > 5 && recentAvg < baseline * 0.3) hasFpsCrash = true;
+      if (baseline > 5 && recentAvg < baseline * 0.6) hasFpsDrop = true;
+
+      worstJitter = Math.max(worstJitter, avgJitter);
+      worstLoss = Math.max(worstLoss, health.lossRate);
+
+      // Track if any viewer has non-zero bitrate (to detect source freeze)
+      if (recentAvg > 0) allZeroBitrate = false;
+    }
+
+    // SOURCE FREEZE: all viewers at 0fps simultaneously = encoder stopped, not network
+    // Don't degrade — degrading won't help; just hold current tier
+    if (viewerCount > 0 && hasZeroFps && allZeroBitrate) {
+      return 'source-stall';  // special: no action taken
+    }
+
+    // Critical: zero fps OR fps crash OR extreme jitter OR extreme loss
+    if (hasZeroFps || hasFpsCrash || worstJitter > this.jitterCriticalMs || worstLoss > this.lossCriticalRate) {
+      return 'critical';
+    }
+    // Warning: fps drop OR high jitter OR notable loss  
+    // Loss alone only triggers warning if combined with elevated jitter (>20ms)
+    if (hasFpsDrop || worstJitter > this.jitterWarnMs ||
+        (worstLoss > this.lossWarnRate && worstJitter > 20)) {
+      return 'warning';
+    }
+    return 'good';
+  }
+
+  _getMinViewerBitrate() {
+    let minMbps = Infinity;
+    for (const [, health] of this.viewerHealth) {
+      if (health.bitrateMbps < minMbps) minMbps = health.bitrateMbps;
+    }
+    return minMbps === Infinity ? 0 : minMbps;
+  }
+
+  _stepDown(steps) {
+    const prevTier = this.tierIndex;
+    this.tierIndex = Math.min(DEGRADATION_TIERS.length - 1, this.tierIndex + steps);
+    if (this.tierIndex !== prevTier) {
+      // Reset baselines since FPS target changed — prevents cross-tier confusion
+      for (const [, health] of this.viewerHealth) {
+        health.baselineSamples = 0;
+        health.baselineFps = 0;
+      }
+      this._applyTier();
+      const t = this.currentTier;
+      logger.warn('[ABR] DEGRADE tier ' + prevTier + '->' + this.tierIndex + ' (' + t.label + ') ' +
+        (this.effectiveBitrate / 1e6).toFixed(1) + 'Mbps @' + this.effectiveFps + 'fps' +
+        (t.scaleDown > 1 ? ' scale=' + t.scaleDown + 'x' : ''));
+    }
+    this.lastDegradeTime = Date.now();
+    this.goodHealthStart = 0;
+  }
+
+  _stepUp(steps) {
+    const prevTier = this.tierIndex;
+    this.tierIndex = Math.max(0, this.tierIndex - steps);
+    if (this.tierIndex !== prevTier) {
+      // Reset baselines since FPS target changed
+      for (const [, health] of this.viewerHealth) {
+        health.baselineSamples = 0;
+        health.baselineFps = 0;
+      }
+      this._applyTier();
+      const t = this.currentTier;
+      logger.info('[ABR] RECOVER tier ' + prevTier + '->' + this.tierIndex + ' (' + t.label + ') ' +
+        (this.effectiveBitrate / 1e6).toFixed(1) + 'Mbps @' + this.effectiveFps + 'fps' +
+        (t.scaleDown > 1 ? ' scale=' + t.scaleDown + 'x' : ''));
+    }
+    this.lastRecoverTime = Date.now();
+    this.goodHealthStart = 0;
+  }
+
+  _applyTier() {
+    const producer = this.app.videoProducer;
+    if (!producer || !producer.rtpSender) return;
+
+    const sender = producer.rtpSender;
+    const params = sender.getParameters();
+    if (!params.encodings?.length) return;
+
+    const tier = this.currentTier;
+    params.encodings[0].maxBitrate = this.effectiveBitrate;
+    params.encodings[0].maxFramerate = this.effectiveFps;
+    params.encodings[0].scaleResolutionDownBy = tier.scaleDown;
+
+    sender.setParameters(params).catch(err => {
+      logger.warn('[ABR] setParameters failed: ' + err.message);
+    });
+  }
+
+  getStatusText() {
+    if (!this.profileMaxBitrate) return '--';
+    const t = this.currentTier;
+    return t.label + ' ' + (this.effectiveBitrate / 1e6).toFixed(1) + 'Mbps @' + this.effectiveFps + 'fps' +
+      (t.scaleDown > 1 ? ' /' + t.scaleDown + 'x' : '');
+  }
+}
 
 // ============================================
 // STREAMER APP (SFU MODE)
@@ -255,7 +525,7 @@ class StreamerApp {
       this.audioProducer = null;   // mediasoup Producer (audio)
       this.localStream = null;
       this.captureProfile = null;
-      this.selectedProfileKey = 'ultra';
+      this.selectedProfileKey = 'quality';
       this.includeAudio = true;
       this.isBroadcasting = false;
       this.streamerName = '';
@@ -265,6 +535,7 @@ class StreamerApp {
       this._prevBytesSent = 0;
       this._prevFramesEncoded = 0;
       this._prevStatsTimestamp = 0;
+      this.abr = new AdaptiveQualityController(this);
 
       logger.info('StreamerApp initializing (SFU mode)...');
       this.attachEventListeners();
@@ -304,7 +575,7 @@ class StreamerApp {
   }
 
   getActiveQualityProfile() {
-    return QUALITY_PROFILES[this.selectedProfileKey] || QUALITY_PROFILES.balanced;
+    return QUALITY_PROFILES[this.selectedProfileKey] || QUALITY_PROFILES.quality;
   }
 
   setQualityProfile(profileKey) {
@@ -316,26 +587,14 @@ class StreamerApp {
     this.refreshQualityProfileUi();
     logger.info('Quality profile set to ' + QUALITY_PROFILES[profileKey].label);
 
-    if (this.videoProducer) {
-      this.updateProducerEncoding().catch((error) => {
-        logger.warn('Could not update producer encoding: ' + error.message);
-      });
-    }
+    // Update ABR — resets to max quality tier for the new profile
+    this.abr.setProfile(QUALITY_PROFILES[profileKey].maxBitrate, QUALITY_PROFILES[profileKey].maxFrameRate);
   }
 
   async updateProducerEncoding() {
-    if (!this.videoProducer || !this.videoProducer.rtpSender) return;
-
+    // Delegate to ABR — resets to max quality tier for active profile
     const profile = this.getActiveQualityProfile();
-    const sender = this.videoProducer.rtpSender;
-    const params = sender.getParameters();
-    if (!params.encodings?.length) return;
-
-    params.encodings[0].maxBitrate = profile.maxBitrate;
-    params.encodings[0].maxFramerate = profile.maxFrameRate;
-
-    await sender.setParameters(params);
-    logger.info('[SFU] Updated producer encoding: maxBitrate=' + (profile.maxBitrate / 1000000) + 'Mbps maxFps=' + profile.maxFrameRate);
+    this.abr.setProfile(profile.maxBitrate, profile.maxFrameRate);
   }
 
   refreshQualityProfileUi() {
@@ -438,17 +697,25 @@ class StreamerApp {
     this.socket.on('viewer-left', (data) => {
       logger.info('Viewer left');
       this.viewers.delete(data.viewerId);
+      this.abr.removeViewer(data.viewerId);
       this.updateViewersList();
     });
 
     this.socket.on('viewer-quality-report', (data) => {
-      // Just log for diagnostics — no adaptation needed, SFU handles forwarding
+      // Feed quality reports to adaptive bitrate controller
+      this.abr.onViewerReport(data.viewerId, {
+        fps: data.fps,
+        jitterMs: data.jitterMs,
+        lossRate: data.lossRate || 0,
+        bitrateMbps: data.bitrateMbps || 0,
+      });
+
       if (!this._qrLogCounter) this._qrLogCounter = 0;
       this._qrLogCounter++;
       if (this._qrLogCounter % 5 === 0) {
         const viewer = this.viewers.get(data.viewerId);
         const name = viewer ? viewer.name : data.viewerId;
-        logger.debug('[DIAG:QR] ' + name + ' | fps=' + data.fps + ' bitrate=' + data.bitrateMbps + 'Mbps res=' + data.frameWidth + 'x' + data.frameHeight);
+        logger.debug('[DIAG:QR] ' + name + ' | fps=' + data.fps + ' bitrate=' + data.bitrateMbps + 'Mbps res=' + data.frameWidth + 'x' + data.frameHeight + ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms [ABR:' + this.abr.getStatusText() + ']');
       }
     });
   }
@@ -512,12 +779,18 @@ class StreamerApp {
 
       grid.innerHTML = '';
 
-      sources.forEach(source => {
+      sources
+        .sort((left, right) => {
+          if (left.kind === right.kind) return left.name.localeCompare(right.name);
+          return left.kind === 'window' ? -1 : 1;
+        })
+        .forEach(source => {
         const sourceEl = document.createElement('div');
         sourceEl.className = 'source-tile';
         sourceEl.innerHTML =
           '<img src="' + source.thumbnail + '" alt="' + source.name + '">' +
           '<p>' + source.name + '</p>' +
+          '<span class="source-kind">' + source.kind + '</span>' +
           '<button class="btn btn-small">Stream This</button>';
         sourceEl.querySelector('button').addEventListener('click', () => {
           logger.info('Selected: ' + source.name);
@@ -533,6 +806,13 @@ class StreamerApp {
   async startStreaming(sourceId, sourceName) {
     try {
       logger.info('Starting stream: ' + sourceName);
+
+      const isWindowCapture = sourceId.startsWith('window:');
+      if (isWindowCapture && window.electron?.prepareForCapture) {
+        logger.info('Minimizing streamer window before window capture');
+        await window.electron.prepareForCapture();
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
 
       const stream = await this.captureSourceStream(sourceId);
 
@@ -552,12 +832,16 @@ class StreamerApp {
           ' maxBitrate=' + (prof.maxBitrate / 1000000) + 'Mbps'
         );
 
+        // Init ABR with profile ceiling
+        this.abr.setProfile(prof.maxBitrate, prof.maxFrameRate);
+
         // Produce video via SFU transport (single encoder for ALL viewers!)
         this.videoProducer = await this.sendTransport.produce({
           track: videoTrack,
           encodings: [{
             maxBitrate: prof.maxBitrate,
             maxFramerate: prof.maxFrameRate,
+            scaleResolutionDownBy: 1.0,
           }],
           codecOptions: {
             videoGoogleStartBitrate: 1000,
@@ -681,6 +965,13 @@ class StreamerApp {
         });
 
         this.updateStatsDisplay(bitrateMbps, fps);
+
+        // Run ABR evaluation every stats tick
+        this.abr.evaluate();
+
+        // Show ABR state in the UI
+        const abrEl = document.getElementById('abrStatus');
+        if (abrEl) abrEl.textContent = this.abr.getStatusText();
       } catch (error) {
         // Ignore transient stats errors
       }
@@ -719,6 +1010,12 @@ class StreamerApp {
     this.viewers.clear();
     this.updateViewersList();
     logger.info('Stream stopped');
+
+    if (window.electron?.restoreAfterCapture) {
+      window.electron.restoreAfterCapture().catch((error) => {
+        logger.warn('Could not restore streamer window: ' + error.message);
+      });
+    }
 
     this.hideStreamPanel();
     this.showCapturePanel();

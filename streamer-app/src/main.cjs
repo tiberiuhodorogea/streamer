@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, desktopCapturer } = require('electron');
 const path = require('path');
 
 let mainWindow;
+const APP_CAPTURE_NAMES = new Set(['Streamer Studio', 'P2P Stream - Streamer']);
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({
@@ -15,6 +16,8 @@ const createWindow = () => {
       sandbox: false // Disable sandbox to allow screen capture
     }
   });
+
+  mainWindow.setContentProtection(true);
 
   // Auto-approve screen capture requests
   mainWindow.webContents.session.setPermissionRequestHandler((webContents, permission, callback) => {
@@ -45,15 +48,36 @@ ipcMain.handle('get-capture-sources', async () => {
       thumbnailSize: { width: 150, height: 150 }
     });
 
-    return sources.map(source => ({
-      id: source.id,
-      name: source.name,
-      thumbnail: source.thumbnail.toDataURL()
-    }));
+    return sources
+      .filter(source => !APP_CAPTURE_NAMES.has(source.name))
+      .map(source => ({
+        id: source.id,
+        name: source.name,
+        kind: source.id.startsWith('window:') ? 'window' : 'screen',
+        thumbnail: source.thumbnail.toDataURL()
+      }));
   } catch (error) {
     console.error('Error getting capture sources:', error);
     return [];
   }
+});
+
+ipcMain.handle('prepare-for-capture', async () => {
+  if (!mainWindow) return { success: false, reason: 'no-window' };
+
+  mainWindow.minimize();
+  return { success: true };
+});
+
+ipcMain.handle('restore-after-capture', async () => {
+  if (!mainWindow) return { success: false, reason: 'no-window' };
+
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.show();
+  mainWindow.focus();
+  return { success: true };
 });
 
 

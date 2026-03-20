@@ -228,6 +228,10 @@ class ViewerApp {
     document.getElementById('refreshStreamsBtn').addEventListener('click', () => this.loadAvailableStreams());
     document.getElementById('disconnectBtn').addEventListener('click', () => this.disconnect());
     document.getElementById('clearDebugBtn').addEventListener('click', () => debugConsole.clear());
+    document.getElementById('dismissErrorBtn').addEventListener('click', () => this.hideError());
+    document.getElementById('errorModal').addEventListener('click', (event) => {
+      if (event.target.id === 'errorModal') this.hideError();
+    });
     document.getElementById('playPauseBtn').addEventListener('click', () => this.togglePlayback());
     document.getElementById('muteBtn').addEventListener('click', () => this.toggleMute());
     document.getElementById('fullscreenBtn').addEventListener('click', () => this.toggleFullscreen());
@@ -251,10 +255,33 @@ class ViewerApp {
     badge.style.backgroundColor = color;
   }
 
+  hideError() {
+    document.body.classList.remove('modal-open');
+    document.getElementById('errorModal').style.display = 'none';
+  }
+
+  async exitFullscreenIfNeeded() {
+    const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+    if (!fullscreenElement) return;
+
+    try {
+      if (document.exitFullscreen) {
+        await document.exitFullscreen();
+      } else if (document.webkitExitFullscreen) {
+        document.webkitExitFullscreen();
+      }
+    } catch (error) {
+      debugConsole.warn('Could not exit fullscreen cleanly: ' + error.message);
+    }
+  }
+
   showError(message) {
     debugConsole.error(message);
     document.getElementById('errorMessage').textContent = message;
-    document.getElementById('errorModal').style.display = 'flex';
+    this.exitFullscreenIfNeeded().finally(() => {
+      document.body.classList.add('modal-open');
+      document.getElementById('errorModal').style.display = 'flex';
+    });
   }
 
   async connect() {
@@ -263,6 +290,7 @@ class ViewerApp {
 
     debugConsole.info('Connect requested');
     debugConsole.info('Server: ' + serverUrl);
+    this.hideError();
 
     if (!serverUrl || !viewerName) {
       this.showError('Please fill in all fields');
@@ -566,6 +594,7 @@ class ViewerApp {
 
         let fps = null;
         let bitrateMbps = null;
+        let intervalLossRate = null;
 
         if (this._prevStatsTimestamp > 0) {
           const elapsed = (now - this._prevStatsTimestamp) / 1000;
@@ -576,11 +605,19 @@ class ViewerApp {
             fps = Number((frameDelta / elapsed).toFixed(0));
             document.getElementById('streamBitrate').textContent = bitrateMbps + ' Mbps';
             document.getElementById('streamFps').textContent = fps;
+
+            // Interval-based packet loss (delta since last report, not cumulative)
+            const lostDelta = packetsLost - (this._prevPacketsLost || 0);
+            const recvDelta = packetsReceived - (this._prevPacketsReceived || 0);
+            const totalDelta = lostDelta + recvDelta;
+            intervalLossRate = totalDelta > 0 ? Math.max(0, lostDelta) / totalDelta : 0;
           }
         }
 
         this._prevBytesReceived = bytesReceived;
         this._prevFramesDecoded = framesDecoded;
+        this._prevPacketsLost = packetsLost;
+        this._prevPacketsReceived = packetsReceived;
         this._prevStatsTimestamp = now;
 
         if (frameWidth && frameHeight) {
@@ -599,9 +636,11 @@ class ViewerApp {
         }
 
         if (fps !== null && this.socket && this.selectedStreamer) {
+          const lossRate = intervalLossRate != null ? intervalLossRate : 0;
           this.socket.emit('viewer-quality-report', {
             streamerId: this.selectedStreamer,
-            fps, bitrateMbps, frameWidth, frameHeight, jitterMs
+            fps, bitrateMbps, frameWidth, frameHeight, jitterMs,
+            lossRate: Number(lossRate.toFixed(4)),
           });
 
           // Detailed diagnostic log every 5 seconds
@@ -624,15 +663,18 @@ class ViewerApp {
     }, 1000);
   }
 
-  handleStreamerDisconnected() {
+  async handleStreamerDisconnected() {
     this.removeConnection();
-    this.showError('Streamer disconnected');
+    await this.exitFullscreenIfNeeded();
     this.hidePlayerPanel();
     this.showStreamsPanel();
     document.getElementById('connectionQuality').textContent = '';
+    this.showError('Streamer disconnected');
   }
 
-  disconnect() {
+  async disconnect() {
+    this.hideError();
+    await this.exitFullscreenIfNeeded();
     this.removeConnection();
     this.hidePlayerPanel();
     this.showStreamsPanel();

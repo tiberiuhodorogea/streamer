@@ -279,6 +279,18 @@ class AdaptiveQualityController {
 
     // Recovery probe: if stuck at MIN for this long, force a step-up attempt
     this.recoveryProbeMs = 30000;     // 30s at MIN → try stepping up
+
+    // Server-side BWE data (updated from signaling server RTCP polling)
+    this._serverBwe = null;           // latest server-bwe event
+    this._serverBweTime = 0;          // timestamp of last server-bwe
+
+    // BWE thresholds for early warning
+    this.rttWarnMs = 150;             // RTT above 150ms = warning
+    this.rttCriticalMs = 300;         // RTT above 300ms = critical
+    this.nackRateWarn = 0.05;         // >5% packets NACKed = warning
+    this.nackRateCritical = 0.15;     // >15% packets NACKed = critical
+    this.scoreWarn = 6;               // mediasoup score below 6 = warning
+    this.scoreCritical = 3;           // mediasoup score below 3 = critical
   }
 
   get tiers() { return DEGRADATION_TIERS; }
@@ -343,6 +355,12 @@ class AdaptiveQualityController {
     this.viewerHealth.delete(viewerId);
   }
 
+  // Called when server sends RTCP-based BWE data
+  onServerBwe(bweData) {
+    this._serverBwe = bweData;
+    this._serverBweTime = Date.now();
+  }
+
   // Called every stats tick (~1s)
   evaluate() {
     if (!this.enabled || this.viewerHealth.size === 0) return;
@@ -365,6 +383,13 @@ class AdaptiveQualityController {
       }
       if (this.goodHealthStart) {
         diag += ' | goodFor=' + ((now - this.goodHealthStart) / 1000).toFixed(1) + 's';
+      }
+      // Append server BWE summary if available
+      const bwe = this._serverBwe;
+      const bweAge = now - this._serverBweTime;
+      if (bwe && bweAge < 6000) {
+        const agg = bwe.aggregate;
+        diag += ' | BWE rtt=' + (agg.worstRttMs || '--') + 'ms nack=' + ((agg.worstNackRate || 0) * 100).toFixed(1) + '% score=' + (agg.minScore != null ? agg.minScore : '--') + ' avail=' + (agg.minAvailableMbps != null ? agg.minAvailableMbps.toFixed(1) : '--') + 'Mbps';
       }
       logger.debug(diag);
     }
@@ -394,9 +419,16 @@ class AdaptiveQualityController {
         } else if (now - this.goodHealthStart >= this.recoverWaitMs &&
                    now - this.lastRecoverTime >= this.recoverCooldownMs) {
           // Gate: only step up if actual bitrate can support the next tier
+          // Use server BWE available bitrate if available (more accurate than viewer report)
           const nextTier = this.tiers[this.tierIndex - 1];
           const neededMbps = (this.profileMaxBitrate * nextTier.bitratePct) / 1e6;
-          const currentMbps = this._getMinViewerBitrate();
+          const viewerMbps = this._getMinViewerBitrate();
+          const bwe = this._serverBwe;
+          const bweAge = now - this._serverBweTime;
+          const bweAvail = (bwe && bweAge < 6000 && bwe.aggregate.minAvailableMbps != null)
+            ? bwe.aggregate.minAvailableMbps : null;
+          // Prefer BWE available bitrate (transport estimate), fall back to viewer-reported
+          const currentMbps = bweAvail != null ? Math.min(bweAvail, viewerMbps) : viewerMbps;
           if (currentMbps >= neededMbps * 0.35) {
             const veryGood = this._isVeryGoodHealth();
             this._stepUp(veryGood ? 2 : 1);
@@ -466,14 +498,39 @@ class AdaptiveQualityController {
       return 'source-stall';  // special: no action taken
     }
 
-    // Critical: zero fps OR fps crash OR extreme jitter OR extreme loss
-    if (hasZeroFps || hasFpsCrash || worstJitter > this.jitterCriticalMs || worstLoss > this.lossCriticalRate) {
+    // ── Server-side BWE signals (RTCP-derived, leading indicators) ──
+    // BWE data is fresher and more reliable than viewer self-reports for
+    // transport-level congestion. Use RTT, NACK rate, and mediasoup score
+    // as early-warning escalators.
+    let bweWarn = false;
+    let bweCritical = false;
+    const bwe = this._serverBwe;
+    const bweAge = Date.now() - this._serverBweTime;
+    if (bwe && bweAge < 6000) {  // only use BWE data if < 6s old
+      const agg = bwe.aggregate;
+      // RTT spike = congestion indicator (only trust values < 10s, null means unavailable)
+      if (agg.worstRttMs != null && agg.worstRttMs > 0 && agg.worstRttMs < 10000) {
+        if (agg.worstRttMs > this.rttCriticalMs) bweCritical = true;
+        else if (agg.worstRttMs > this.rttWarnMs) bweWarn = true;
+      }
+      // High NACK rate = packets being lost and retransmitted
+      if (agg.worstNackRate > this.nackRateCritical) bweCritical = true;
+      else if (agg.worstNackRate > this.nackRateWarn) bweWarn = true;
+      // Low mediasoup score = overall quality degradation
+      if (agg.minScore != null) {
+        if (agg.minScore <= this.scoreCritical) bweCritical = true;
+        else if (agg.minScore <= this.scoreWarn) bweWarn = true;
+      }
+    }
+
+    // Critical: zero fps OR fps crash OR extreme jitter OR extreme loss OR BWE critical
+    if (hasZeroFps || hasFpsCrash || worstJitter > this.jitterCriticalMs || worstLoss > this.lossCriticalRate || bweCritical) {
       return 'critical';
     }
-    // Warning: fps drop OR high jitter OR notable loss
+    // Warning: fps drop OR high jitter OR notable loss OR BWE warning
     // Loss alone only triggers warning if combined with elevated jitter (>40ms)
     if (hasFpsDrop || worstJitter > this.jitterWarnMs ||
-        (worstLoss > this.lossWarnRate && worstJitter > 40)) {
+        (worstLoss > this.lossWarnRate && worstJitter > 40) || bweWarn) {
       return 'warning';
     }
     return 'good';
@@ -492,6 +549,16 @@ class AdaptiveQualityController {
       if (baseline > 5 && recentAvg < baseline * 0.95) return false;
       if (jAvg > 30) return false;
       if (health.lossRate > 0.01) return false;
+    }
+
+    // Also check server BWE: very good requires clean transport
+    const bwe = this._serverBwe;
+    const bweAge = Date.now() - this._serverBweTime;
+    if (bwe && bweAge < 6000) {
+      const agg = bwe.aggregate;
+      if (agg.worstRttMs > 100) return false;       // RTT should be low
+      if (agg.worstNackRate > 0.02) return false;    // minimal retransmissions
+      if (agg.minScore != null && agg.minScore < 7) return false;  // good score
     }
 
     return true;
@@ -838,6 +905,18 @@ class StreamerApp {
         const viewer = this.viewers.get(data.viewerId);
         const name = viewer ? viewer.name : data.viewerId;
         logger.debug('[DIAG:QR] ' + name + ' | fps=' + data.fps + ' bitrate=' + data.bitrateMbps + 'Mbps res=' + data.frameWidth + 'x' + data.frameHeight + ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms [ABR:' + this.abr.getStatusText() + ']');
+      }
+    });
+
+    this.socket.on('server-bwe', (data) => {
+      this.abr.onServerBwe(data);
+
+      // Log BWE data periodically (every other event ≈ every 4s)
+      if (!this._bweLogCounter) this._bweLogCounter = 0;
+      this._bweLogCounter++;
+      if (this._bweLogCounter % 2 === 0) {
+        const agg = data.aggregate;
+        logger.debug('[BWE] rtt=' + (agg.worstRttMs || '--') + 'ms nack=' + ((agg.worstNackRate || 0) * 100).toFixed(1) + '% score=' + (agg.minScore != null ? agg.minScore : '--') + ' avail=' + (agg.minAvailableMbps != null ? agg.minAvailableMbps.toFixed(1) : '--') + 'Mbps del=' + (agg.minDeliveryMbps != null ? agg.minDeliveryMbps.toFixed(1) : '--') + 'Mbps');
       }
     });
   }
@@ -1205,12 +1284,25 @@ class StreamerApp {
         if (bitrateMbps !== null && window.electron?.sessionLog) {
           this._statsTickCount = (this._statsTickCount || 0) + 1;
           if (this._statsTickCount % 5 === 0) {
-            window.electron.sessionLog('stats-snapshot', {
+            const snapshot = {
               bitrateMbps: +bitrateMbps.toFixed(2), fps,
               abrTier: this.abr.tierIndex,
               abrLabel: this.abr.tiers?.[this.abr.tierIndex]?.label,
               viewers: this.viewers.size,
-            });
+            };
+            // Include server BWE metrics if available
+            const bwe = this.abr._serverBwe;
+            const bweAge = Date.now() - this.abr._serverBweTime;
+            if (bwe && bweAge < 6000) {
+              snapshot.bwe = {
+                rttMs: bwe.aggregate.worstRttMs || null,
+                nackRate: bwe.aggregate.worstNackRate || 0,
+                score: bwe.aggregate.minScore,
+                availableMbps: bwe.aggregate.minAvailableMbps,
+                deliveryMbps: bwe.aggregate.minDeliveryMbps,
+              };
+            }
+            window.electron.sessionLog('stats-snapshot', snapshot);
           }
         }
 

@@ -122,6 +122,9 @@ const config = {
   RTC_MAX_PORT: 49999,
 };
 
+// Server-side BWE polling interval (ms)
+const BWE_POLL_INTERVAL_MS = 2000;
+
 const MEDIA_CODECS = [
   {
     kind: 'audio',
@@ -183,6 +186,7 @@ function respond(clientId, reqId, data = {}) {
 let worker = null;
 const rooms = new Map();
 const clients = new Map();
+const bweIntervals = new Map();  // roomId → interval handle
 
 // ============================================
 // MEDIASOUP WORKER
@@ -622,6 +626,12 @@ async function handleConsume(clientId, data) {
         viewer.consumers.delete(consumer.id);
       });
 
+      // Track mediasoup quality score (0-10) per consumer
+      consumer.on('score', (score) => {
+        if (!viewer._bweScores) viewer._bweScores = {};
+        viewer._bweScores[consumer.kind] = score;
+      });
+
       consumerDataList.push({
         id: consumer.id,
         producerId: producer.id,
@@ -633,6 +643,12 @@ async function handleConsume(clientId, data) {
     }
 
     respond(clientId, data._reqId, { consumers: consumerDataList });
+
+    // Start BWE polling for this room if not already running
+    const roomId = client.roomId;
+    if (roomId && !bweIntervals.has(roomId)) {
+      startBwePolling(roomId);
+    }
   } catch (error) {
     console.error('[SFU] Consume failed: ' + error.message);
     respond(clientId, data._reqId, { error: error.message });
@@ -649,6 +665,173 @@ async function handleConsumerResume(clientId, data) {
   if (consumer) {
     await consumer.resume();
     console.log('[SFU] Consumer resumed: ' + consumer.kind + ' for viewer ' + viewer.name);
+  }
+}
+
+// ============================================
+// SERVER-SIDE BANDWIDTH ESTIMATION (BWE)
+// Polls consumer.getStats() every 2s to extract RTCP-derived
+// metrics: delivery bitrate, NACK rate, PLI/FIR counts, RTT, score.
+// Sends aggregated 'server-bwe' event to the streamer.
+// ============================================
+
+function startBwePolling(roomId) {
+  if (bweIntervals.has(roomId)) return;
+
+  // Per-viewer state for delta calculations
+  const viewerPrev = new Map();
+
+  const interval = setInterval(async () => {
+    const room = rooms.get(roomId);
+    if (!room || room.viewers.size === 0) return;
+
+    const viewerBwe = {};
+    let hasData = false;
+
+    for (const [viewerId, viewer] of room.viewers) {
+      // Find the video consumer for this viewer
+      let videoConsumer = null;
+      for (const [, consumer] of viewer.consumers) {
+        if (consumer.kind === 'video' && !consumer.closed) {
+          videoConsumer = consumer;
+          break;
+        }
+      }
+      if (!videoConsumer) continue;
+
+      try {
+        const stats = await videoConsumer.getStats();
+        let outbound = null;
+
+        stats.forEach(report => {
+          if (report.type === 'outbound-rtp' && report.kind === 'video') {
+            outbound = report;
+          }
+        });
+
+        if (!outbound) continue;
+
+        const prev = viewerPrev.get(viewerId) || {};
+        const now = outbound.timestamp || Date.now();
+        const elapsed = prev.timestamp ? (now - prev.timestamp) / 1000 : 0;
+
+        let deliveryMbps = 0;
+        let nackRate = 0;
+
+        if (elapsed > 0) {
+          const bytesDelta = (outbound.bytesSent || 0) - (prev.bytesSent || 0);
+          deliveryMbps = (bytesDelta * 8) / elapsed / 1_000_000;
+
+          const nackDelta = (outbound.nackCount || 0) - (prev.nackCount || 0);
+          const packetsDelta = (outbound.packetsSent || 0) - (prev.packetsSent || 0);
+          nackRate = packetsDelta > 0 ? nackDelta / packetsDelta : 0;
+        }
+
+        // Save for next delta
+        viewerPrev.set(viewerId, {
+          timestamp: now,
+          bytesSent: outbound.bytesSent || 0,
+          nackCount: outbound.nackCount || 0,
+          packetsSent: outbound.packetsSent || 0,
+          pliCount: outbound.pliCount || 0,
+          firCount: outbound.firCount || 0,
+        });
+
+        // mediasoup consumer score (set by 'score' event listener)
+        const scoreData = viewer._bweScores?.video;
+        const score = scoreData?.score ?? null;
+        const producerScore = scoreData?.producerScore ?? null;
+
+        // Transport-level stats: RTT (from DTLS/ICE) and available bitrate
+        // NOTE: consumer outbound-rtp stats do NOT have roundTripTime in mediasoup.
+        // RTT must come from the transport's own stats.
+        let rttMs = null;
+        let availableBitrateMbps = null;
+        if (viewer.consumerTransport) {
+          try {
+            const tStats = await viewer.consumerTransport.getStats();
+            tStats.forEach(r => {
+              if (r.type === 'webrtc-transport') {
+                // mediasoup transport stats expose iceSelectedTuple RTT
+                if (r.iceSelectedTuple?.rtt != null) {
+                  rttMs = Number(r.iceSelectedTuple.rtt.toFixed(1));
+                }
+                if (r.availableOutgoingBitrate != null) {
+                  availableBitrateMbps = Number((r.availableOutgoingBitrate / 1_000_000).toFixed(2));
+                }
+              }
+            });
+          } catch {}
+          // Sanity: discard RTT values > 10s (clearly invalid)
+          if (rttMs != null && rttMs > 10000) rttMs = null;
+        }
+
+        viewerBwe[viewerId] = {
+          deliveryMbps: Number(deliveryMbps.toFixed(2)),
+          rttMs,
+          nackRate: Number(nackRate.toFixed(4)),
+          pliCount: outbound.pliCount || 0,
+          firCount: outbound.firCount || 0,
+          score,
+          producerScore,
+          availableBitrateMbps,
+        };
+        hasData = true;
+
+      } catch (err) {
+        // Consumer may have closed between check and getStats
+      }
+    }
+
+    if (!hasData) return;
+
+    // Compute aggregate worst-case metrics
+    let worstRtt = 0;
+    let worstNackRate = 0;
+    let minScore = 10;
+    let minAvailableMbps = Infinity;
+    let minDeliveryMbps = Infinity;
+
+    for (const vId of Object.keys(viewerBwe)) {
+      const v = viewerBwe[vId];
+      if (v.rttMs != null && v.rttMs > worstRtt) worstRtt = v.rttMs;
+      if (v.nackRate > worstNackRate) worstNackRate = v.nackRate;
+      if (v.score != null && v.score < minScore) minScore = v.score;
+      if (v.availableBitrateMbps != null && v.availableBitrateMbps < minAvailableMbps) {
+        minAvailableMbps = v.availableBitrateMbps;
+      }
+      if (v.deliveryMbps < minDeliveryMbps) minDeliveryMbps = v.deliveryMbps;
+    }
+
+    const bweEvent = {
+      viewers: viewerBwe,
+      aggregate: {
+        worstRttMs: worstRtt,
+        worstNackRate: Number(worstNackRate.toFixed(4)),
+        minScore: minScore === 10 ? null : minScore,
+        minAvailableMbps: minAvailableMbps === Infinity ? null : minAvailableMbps,
+        minDeliveryMbps: minDeliveryMbps === Infinity ? null : minDeliveryMbps,
+      },
+    };
+
+    // Send to streamer
+    send(room.streamer.ws, 'server-bwe', bweEvent);
+
+    // Log BWE snapshot
+    appendSessionLog('server-bwe', bweEvent);
+  }, BWE_POLL_INTERVAL_MS);
+
+  bweIntervals.set(roomId, interval);
+  console.log('[BWE] Started polling for room ' + roomId);
+  appendSessionLog('bwe-started', { roomId });
+}
+
+function stopBwePolling(roomId) {
+  const interval = bweIntervals.get(roomId);
+  if (interval) {
+    clearInterval(interval);
+    bweIntervals.delete(roomId);
+    console.log('[BWE] Stopped polling for room ' + roomId);
   }
 }
 
@@ -727,6 +910,7 @@ function handleDisconnect(clientId) {
   if (client.role === 'streamer') {
     const room = rooms.get(clientId);
     if (room) {
+      stopBwePolling(clientId);
       appendSessionLog('streamer-disconnected', { clientId, name: room.streamer.name });
       for (const [viewerId, viewer] of room.viewers) {
         send(viewer.ws, 'streamer-disconnected', {});
@@ -768,6 +952,7 @@ function shutdown() {
   console.log('\n[Server] Shutting down gracefully...');
   writeSessionSummary();
   clearInterval(heartbeatTimer);
+  for (const roomId of bweIntervals.keys()) stopBwePolling(roomId);
   wss.clients.forEach((ws) => ws.terminate());
   if (worker) worker.close();
   server.close(() => {

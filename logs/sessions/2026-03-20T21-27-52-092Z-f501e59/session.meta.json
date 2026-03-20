@@ -1,0 +1,11 @@
+{
+  "sessionId": "2026-03-20T21-27-52-092Z",
+  "gitCommit": "f501e59",
+  "startedAt": "2026-03-20T21:27:52.092Z",
+  "server": "signaling-server",
+  "announcedIp": "100.116.189.118",
+  "nodeVersion": "v22.19.0",
+  "platform": "win32",
+  "arch": "x64",
+  "sessionDir": "V:\\streamer\\logs\\sessions\\2026-03-20T21-27-52-092Z-f501e59"
+}

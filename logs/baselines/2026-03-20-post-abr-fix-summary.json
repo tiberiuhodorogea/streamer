@@ -1,0 +1,29 @@
+{
+  "label": "Post ABR fix (Electron 41, H.264 High Profile, rewritten ABR)",
+  "date": "2026-03-20",
+  "commit": "1308f98",
+  "electronVersion": "41.0.3",
+  "chromeVersion": "146.0.7680.80",
+  "h264Profile": "640032 (High Profile Level 5.0)",
+  "captureMethod": "screen-dxgi",
+  "game": "Dead by Daylight",
+  "sessionDir": "2026-03-20T21-08-18-752Z-1308f98",
+  "sessionDuration_s": 235,
+  "streamer": {
+    "snapshots": 47,
+    "bitrate_Mbps": { "avg": 14.32, "min": 1.49, "max": 19.44 },
+    "fps": { "avg": 39.4, "min": 34, "max": 41 },
+    "abrEvents": 2,
+    "abrNotes": "1 brief degrade to HIGH, recovered in 7s. MAX tier 97.9% of session.",
+    "abrTierDistribution": { "0_MAX": 46, "1_HIGH": 1 }
+  },
+  "viewer": {
+    "reports": 230,
+    "fps": { "avg": 38.3, "min": 0, "max": 42 },
+    "bitrate_Mbps": { "avg": 14.45, "min": 0, "max": 21.27 },
+    "jitter_ms": { "avg": 33, "min": 24, "max": 90 },
+    "lossRate": { "avg": 0.0013 },
+    "resolutionDistribution": { "1920x1080": 230 },
+    "notes": "100% at full 1080p. Zero resolution drops."
+  }
+}

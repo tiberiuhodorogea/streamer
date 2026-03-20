@@ -1,0 +1,31 @@
+{"ts":"2026-03-20T20:34:35.656Z","type":"streamer-started","payload":{"gitCommit":"1308f98","electronVersion":"27.3.11","chromeVersion":"118.0.5993.159","nodeVersion":"18.17.1","platform":"win32","arch":"x64"}}
+{"ts":"2026-03-20T20:36:07.548Z","type":"stream-start","payload":{"sourceId":"window:3408118:0","sourceName":"DeadByDaylight  ","isGame":true,"gameHwnd":3408118,"gamePid":30272,"gameMode":false,"profile":{"width":1920,"height":1080,"frameRate":60}}}
+{"ts":"2026-03-20T20:36:19.518Z","type":"stats-snapshot","payload":{"bitrateMbps":2.77,"fps":56,"abrTier":0,"viewers":0}}
+{"ts":"2026-03-20T20:36:29.518Z","type":"stats-snapshot","payload":{"bitrateMbps":2.7,"fps":55,"abrTier":0,"viewers":0}}
+{"ts":"2026-03-20T20:36:39.518Z","type":"stats-snapshot","payload":{"bitrateMbps":2.79,"fps":57,"abrTier":0,"viewers":0}}
+{"ts":"2026-03-20T20:36:49.518Z","type":"stats-snapshot","payload":{"bitrateMbps":2.73,"fps":57,"abrTier":0,"viewers":0}}
+{"ts":"2026-03-20T20:36:59.517Z","type":"stats-snapshot","payload":{"bitrateMbps":3.73,"fps":54,"abrTier":0,"viewers":1}}
+{"ts":"2026-03-20T20:37:07.696Z","type":"stats-snapshot","payload":{"bitrateMbps":4.85,"fps":52,"abrTier":0,"viewers":1}}
+{"ts":"2026-03-20T20:37:09.492Z","type":"stream-stop","payload":{}}
+{"ts":"2026-03-20T20:37:12.539Z","type":"stream-start","payload":{"sourceId":"window:3408118:0","sourceName":"DeadByDaylight  ","isGame":true,"gameHwnd":3408118,"gamePid":30272,"gameMode":false,"profile":{"width":1920,"height":1080,"frameRate":60}}}
+{"ts":"2026-03-20T20:37:16.520Z","type":"abr-degrade","payload":{"from":0,"to":2,"label":"MID","bitrateMbps":"9.9","fps":30,"scaleDown":1,"gameMode":false}}
+{"ts":"2026-03-20T20:37:20.519Z","type":"abr-degrade","payload":{"from":2,"to":3,"label":"LOW","bitrateMbps":"7.2","fps":30,"scaleDown":1.5,"gameMode":false}}
+{"ts":"2026-03-20T20:37:22.519Z","type":"stats-snapshot","payload":{"bitrateMbps":1.59,"fps":30,"abrTier":3,"viewers":0}}
+{"ts":"2026-03-20T20:37:22.520Z","type":"abr-degrade","payload":{"from":3,"to":4,"label":"MIN","bitrateMbps":"4.5","fps":30,"scaleDown":2,"gameMode":false}}
+{"ts":"2026-03-20T20:37:32.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.39,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:37:38.540Z","type":"stats-snapshot","payload":{"bitrateMbps":0.38,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:37:38.856Z","type":"stream-stop","payload":{}}
+{"ts":"2026-03-20T20:37:51.544Z","type":"stream-start","payload":{"sourceId":"window:3408118:0","sourceName":"DeadByDaylight  ","isGame":true,"gameHwnd":3408118,"gamePid":30272,"gameMode":false,"profile":{"width":1920,"height":1080,"frameRate":60}}}
+{"ts":"2026-03-20T20:37:55.519Z","type":"abr-degrade","payload":{"from":0,"to":2,"label":"MID","bitrateMbps":"9.9","fps":30,"scaleDown":1,"gameMode":false}}
+{"ts":"2026-03-20T20:37:59.519Z","type":"abr-degrade","payload":{"from":2,"to":3,"label":"LOW","bitrateMbps":"7.2","fps":30,"scaleDown":1.5,"gameMode":false}}
+{"ts":"2026-03-20T20:38:03.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.72,"fps":30,"abrTier":3,"viewers":0}}
+{"ts":"2026-03-20T20:38:03.519Z","type":"abr-degrade","payload":{"from":3,"to":4,"label":"MIN","bitrateMbps":"4.5","fps":30,"scaleDown":2,"gameMode":false}}
+{"ts":"2026-03-20T20:38:13.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.42,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:38:23.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.42,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:38:33.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.42,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:38:43.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.43,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:38:53.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.42,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:39:03.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.43,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:39:13.518Z","type":"stats-snapshot","payload":{"bitrateMbps":0.43,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:39:23.517Z","type":"stats-snapshot","payload":{"bitrateMbps":0.43,"fps":30,"abrTier":4,"viewers":0}}
+{"ts":"2026-03-20T20:39:26.624Z","type":"stream-stop","payload":{}}

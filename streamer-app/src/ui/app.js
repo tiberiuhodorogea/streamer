@@ -774,6 +774,24 @@ class StreamerApp {
       const sources = await window.electron.getCaptureSources();
       logger.info('Found ' + sources.length + ' capture sources');
 
+      // Cache sources for later lookup (e.g. auto screen-capture for games)
+      this._cachedSources = sources;
+
+      // Check native capture availability once
+      if (this._nativeCaptureAvailable == null) {
+        try {
+          this._nativeCaptureAvailable = await window.electron.isNativeCaptureAvailable();
+          if (this._nativeCaptureAvailable) logger.info('[GAME] Native WGC game capture available');
+        } catch (_) {
+          this._nativeCaptureAvailable = false;
+        }
+      }
+
+      const gameCount = sources.filter(s => s.isGame).length;
+      if (gameCount > 0) {
+        logger.info('[GAME] Detected ' + gameCount + ' game source(s)');
+      }
+
       const grid = document.getElementById('sourcesGrid');
       if (!grid) return;
 
@@ -781,20 +799,29 @@ class StreamerApp {
 
       sources
         .sort((left, right) => {
+          // Games first, then windows, then screens
+          if (left.isGame !== right.isGame) return left.isGame ? -1 : 1;
           if (left.kind === right.kind) return left.name.localeCompare(right.name);
           return left.kind === 'window' ? -1 : 1;
         })
         .forEach(source => {
         const sourceEl = document.createElement('div');
-        sourceEl.className = 'source-tile';
+        sourceEl.className = 'source-tile' + (source.isGame ? ' source-tile-game' : '');
+
+        let badges = '';
+        if (source.isGame) {
+          badges += '<span class="source-badge source-game">\uD83C\uDFAE GAME</span>';
+        }
+        badges += '<span class="source-badge source-kind">' + source.kind + '</span>';
+
         sourceEl.innerHTML =
           '<img src="' + source.thumbnail + '" alt="' + source.name + '">' +
           '<p>' + source.name + '</p>' +
-          '<span class="source-kind">' + source.kind + '</span>' +
+          '<div class="source-badges">' + badges + '</div>' +
           '<button class="btn btn-small">Stream This</button>';
         sourceEl.querySelector('button').addEventListener('click', () => {
-          logger.info('Selected: ' + source.name);
-          this.startStreaming(source.id, source.name);
+          logger.info('Selected: ' + source.name + (source.isGame ? ' [GAME]' : ''));
+          this.startStreaming(source.id, source.name, source.isGame);
         });
         grid.appendChild(sourceEl);
       });
@@ -803,12 +830,29 @@ class StreamerApp {
     }
   }
 
-  async startStreaming(sourceId, sourceName) {
+  async startStreaming(sourceId, sourceName, isGame = false) {
     try {
-      logger.info('Starting stream: ' + sourceName);
+      logger.info('Starting stream: ' + sourceName + (isGame ? ' [GAME MODE]' : ''));
 
+      this._isGameCapture = isGame;
       const isWindowCapture = sourceId.startsWith('window:');
-      if (isWindowCapture && window.electron?.prepareForCapture) {
+
+      // ── GAME CAPTURE STRATEGY ──────────────────────────────
+      // For game windows: auto-switch to screen capture.
+      // Chromium window capture fails for most DirectX/Vulkan games,
+      // but screen capture (DXGI Desktop Duplication) works reliably.
+      if (isGame && isWindowCapture) {
+        logger.info('[GAME] Window capture unreliable for games — auto-switching to screen capture');
+        const screenId = await this._findScreenSource();
+        if (screenId) {
+          sourceId = screenId;
+          logger.info('[GAME] Using screen source: ' + screenId);
+        } else {
+          logger.warn('[GAME] No screen source found — attempting window capture anyway');
+        }
+      }
+
+      if (sourceId.startsWith('window:') && window.electron?.prepareForCapture) {
         logger.info('Minimizing streamer window before window capture');
         await window.electron.prepareForCapture();
         await new Promise(resolve => setTimeout(resolve, 300));
@@ -829,7 +873,8 @@ class StreamerApp {
         logger.info(
           '[DIAG:CAPTURE] actual=' + settings.width + 'x' + settings.height + '@' + Math.round(settings.frameRate || 60) + 'fps' +
           ' | profile=' + prof.label + ' maxRes=' + prof.maxWidth + 'x' + prof.maxHeight +
-          ' maxBitrate=' + (prof.maxBitrate / 1000000) + 'Mbps'
+          ' maxBitrate=' + (prof.maxBitrate / 1000000) + 'Mbps' +
+          (isGame ? ' | GAME-OPTIMISED' : '')
         );
 
         // Init ABR with profile ceiling
@@ -849,6 +894,21 @@ class StreamerApp {
         });
 
         logger.info('[SFU] Video producer created (id: ' + this.videoProducer.id + ')');
+
+        // ── GAME ENCODER OPTIMIZATIONS ─────────────────────
+        // Tell WebRTC to sacrifice resolution, not framerate, when under load.
+        // This keeps game motion smooth — the viewer would rather see a slightly
+        // lower-res image than stuttery 60 fps.
+        if (isGame && this.videoProducer.rtpSender) {
+          try {
+            const params = this.videoProducer.rtpSender.getParameters();
+            params.degradationPreference = 'maintain-framerate';
+            await this.videoProducer.rtpSender.setParameters(params);
+            logger.info('[GAME] Encoder set to maintain-framerate (smooth motion > resolution)');
+          } catch (e) {
+            logger.warn('[GAME] Could not set degradationPreference: ' + e.message);
+          }
+        }
 
         this.videoProducer.on('transportclose', () => {
           logger.warn('[SFU] Video producer transport closed');
@@ -899,15 +959,21 @@ class StreamerApp {
 
   async captureSourceStream(sourceId) {
     const profile = this.getActiveQualityProfile();
-    const videoConstraints = {
-      mandatory: {
-        chromeMediaSource: 'desktop',
-        chromeMediaSourceId: sourceId,
-        maxWidth: profile.maxWidth,
-        maxHeight: profile.maxHeight,
-        maxFrameRate: profile.maxFrameRate
-      }
+    const mandatory = {
+      chromeMediaSource: 'desktop',
+      chromeMediaSourceId: sourceId,
+      maxWidth: profile.maxWidth,
+      maxHeight: profile.maxHeight,
+      maxFrameRate: profile.maxFrameRate
     };
+
+    // For game captures, suppress the OS mouse cursor from the stream.
+    // Chromium desktop capture only respects cursor inside the mandatory block.
+    if (this._isGameCapture) {
+      mandatory.cursor = 'never';
+    }
+
+    const videoConstraints = { mandatory };
 
     if (!this.includeAudio) {
       return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
@@ -927,6 +993,26 @@ class StreamerApp {
     } catch (error) {
       logger.warn('Audio capture failed, falling back to video-only: ' + error.message);
       return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+    }
+  }
+
+  /**
+   * Finds the primary screen source from the cached source list.
+   * Used for game capture — screen capture (DXGI Desktop Duplication)
+   * is far more reliable than window capture for DirectX/Vulkan games.
+   */
+  async _findScreenSource() {
+    try {
+      const sources = this._cachedSources || await window.electron.getCaptureSources();
+      const screens = sources.filter(s => s.kind === 'screen');
+      if (screens.length === 0) return null;
+      if (screens.length > 1) {
+        logger.info('[GAME] Multiple screens detected (' + screens.length + ') — using primary');
+      }
+      return screens[0].id;
+    } catch (e) {
+      logger.warn('[GAME] Screen source lookup failed: ' + e.message);
+      return null;
     }
   }
 
@@ -987,6 +1073,12 @@ class StreamerApp {
 
   stopStreaming() {
     logger.info('Stopping stream...');
+
+    // Stop native game capture if active
+    if (this._isGameCapture && window.electron?.stopNativeCapture) {
+      window.electron.stopNativeCapture().catch(() => {});
+    }
+    this._isGameCapture = false;
 
     if (this.videoProducer) {
       this.videoProducer.close();

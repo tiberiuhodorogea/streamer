@@ -1,0 +1,14 @@
+{
+  "name": "game-capture-native",
+  "version": "0.1.0",
+  "description": "Native Windows Graphics Capture addon for game streaming",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "rebuild": "node-gyp rebuild"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.0.0"
+  }
+}

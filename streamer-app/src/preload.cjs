@@ -8,6 +8,12 @@ try {
     startCapture: (sourceId) => ipcRenderer.invoke('start-capture', sourceId),
     prepareForCapture: () => ipcRenderer.invoke('prepare-for-capture'),
     restoreAfterCapture: () => ipcRenderer.invoke('restore-after-capture'),
+
+    // Game capture APIs
+    isNativeCaptureAvailable: () => ipcRenderer.invoke('native-capture-available'),
+    startNativeCapture: (opts) => ipcRenderer.invoke('start-native-capture', opts),
+    stopNativeCapture: () => ipcRenderer.invoke('stop-native-capture'),
+
     on: (channel, func) => ipcRenderer.on(channel, (event, ...args) => func(...args)),
     once: (channel, func) => ipcRenderer.once(channel, (event, ...args) => func(...args)),
   });

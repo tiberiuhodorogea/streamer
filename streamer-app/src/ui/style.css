@@ -328,21 +328,45 @@ section h2 {
   line-height: 1.5;
 }
 
-.source-kind {
+.source-badges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 10px 14px 0;
+}
+
+.source-badge {
   display: inline-flex;
   align-items: center;
-  align-self: flex-start;
-  margin: 10px 14px 0;
   min-height: 28px;
   padding: 0 10px;
   border-radius: 999px;
-  background: rgba(200, 168, 106, 0.12);
-  border: 1px solid rgba(200, 168, 106, 0.18);
-  color: #f4dfb7;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.source-kind {
+  background: rgba(200, 168, 106, 0.12);
+  border: 1px solid rgba(200, 168, 106, 0.18);
+  color: #f4dfb7;
+}
+
+.source-game {
+  background: rgba(76, 175, 80, 0.15);
+  border: 1px solid rgba(76, 175, 80, 0.30);
+  color: #a5d6a7;
+  gap: 4px;
+}
+
+/* Highlight game tiles with a subtle green glow */
+.source-tile-game {
+  border-color: rgba(76, 175, 80, 0.22);
+}
+.source-tile-game:hover {
+  border-color: rgba(76, 175, 80, 0.40);
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.26), 0 0 24px rgba(76, 175, 80, 0.08);
 }
 
 .source-tile button {

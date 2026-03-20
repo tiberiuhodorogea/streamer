@@ -9,24 +9,14 @@ try {
     prepareForCapture: () => ipcRenderer.invoke('prepare-for-capture'),
     restoreAfterCapture: () => ipcRenderer.invoke('restore-after-capture'),
 
-    // Game capture APIs
-    isNativeCaptureAvailable: () => ipcRenderer.invoke('native-capture-available'),
-    startNativeCapture: (opts) => ipcRenderer.invoke('start-native-capture', opts),
-    stopNativeCapture: () => ipcRenderer.invoke('stop-native-capture'),
+    // Session logging — writes structured entries to session JSONL on disk
+    sessionLog: (type, payload) => ipcRenderer.invoke('session-log', { type, payload }),
+    getSessionDir: () => ipcRenderer.invoke('get-session-dir'),
+
+    // Process audio APIs
     isNativeProcessAudioAvailable: () => ipcRenderer.invoke('native-process-audio-available'),
     startNativeProcessAudio: (opts) => ipcRenderer.invoke('start-native-process-audio', opts),
     stopNativeProcessAudio: () => ipcRenderer.invoke('stop-native-process-audio'),
-
-    // WGC frame delivery — receive BGRA frames from native capture
-    onWgcFrame: (callback) => {
-      ipcRenderer.removeAllListeners('wgc-frame');
-      ipcRenderer.on('wgc-frame', (_event, buffer, meta) => {
-        callback(buffer, meta);
-      });
-    },
-    removeWgcFrameListener: () => {
-      ipcRenderer.removeAllListeners('wgc-frame');
-    },
 
     onGameAudioChunk: (callback) => {
       ipcRenderer.removeAllListeners('game-audio-chunk');

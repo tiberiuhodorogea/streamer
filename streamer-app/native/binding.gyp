@@ -6,8 +6,7 @@
     "sources": [
       "src/addon.cpp",
       "src/game_detect.cpp",
-      "src/process_audio.cpp",
-      "src/wgc_capture.cpp"
+      "src/process_audio.cpp"
     ],
     "include_dirs": [
       "<!@(node -p \"require('node-addon-api').include\")"
@@ -28,13 +27,11 @@
           }
         },
         "libraries": [
-          "-lwindowsapp.lib",
           "-lavrt.lib",
-          "-ld3d11.lib",
-          "-ldxgi.lib",
           "-lole32.lib",
-          "-lpsapi.lib"
-          ,"-lpropsys.lib"
+          "-lpsapi.lib",
+          "-lpropsys.lib",
+          "-lmmdevapi.lib"
         ]
       }]
     ]

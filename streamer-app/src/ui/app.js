@@ -237,20 +237,7 @@ const DEGRADATION_TIERS = [
   { bitratePct: 0.25, scaleDown: 2.0, fpsFraction: 0.5, label: 'MIN'  },  // heavy downscale, last resort
 ];
 
-// ============================================
-// GAME-OPTIMISED DEGRADATION TIERS
-// Games look terrible with FPS drops but tolerate resolution scaling well.
-// Strategy: NEVER reduce FPS. Only cut bitrate and scale resolution.
-// More granular steps for smoother transitions during action scenes.
-// ============================================
-const GAME_DEGRADATION_TIERS = [
-  { bitratePct: 1.00, scaleDown: 1.0, fpsFraction: 1.0, label: 'ULTRA' },   // full quality, full fps
-  { bitratePct: 0.80, scaleDown: 1.0, fpsFraction: 1.0, label: 'HIGH'  },   // light bitrate cut — encoder absorbs via QP
-  { bitratePct: 0.65, scaleDown: 1.0, fpsFraction: 1.0, label: 'MED+'  },   // moderate bitrate cut, still native res
-  { bitratePct: 0.50, scaleDown: 1.25, fpsFraction: 1.0, label: 'MED'  },   // mild downscale (1536x864 from 1080p)
-  { bitratePct: 0.40, scaleDown: 1.5, fpsFraction: 1.0, label: 'LOW+'  },   // 1280x720 equivalent — still 60fps
-  { bitratePct: 0.30, scaleDown: 2.0, fpsFraction: 1.0, label: 'LOW'   },   // 960x540 at 60fps — last resort
-];
+
 
 // ============================================
 // ADAPTIVE QUALITY CONTROLLER
@@ -261,7 +248,6 @@ class AdaptiveQualityController {
   constructor(streamerApp) {
     this.app = streamerApp;
     this.enabled = true;
-    this.gameMode = false;            // set by streamer when game capture starts
     this.tierIndex = 0;               // current tier (0 = max quality)
     this.profileMaxBitrate = 0;
     this.profileMaxFps = 60;
@@ -273,27 +259,31 @@ class AdaptiveQualityController {
     // Timing
     this.lastDegradeTime = 0;
     this.lastRecoverTime = 0;
-    this.degradeCooldownMs = 2000;    // react fast to congestion
-    this.recoverCooldownMs = 3000;    // recover aggressively
     this.goodHealthStart = 0;
-    this.recoverWaitMs = 3000;        // 3s good health → step up
+    this._streamStartTime = 0;        // set when stream begins
+    this._stuckAtMinSince = 0;        // for periodic recovery probe
 
-    // Thresholds — loss is SECONDARY (some connections have baseline loss)
-    this.jitterWarnMs = 35;
-    this.jitterCriticalMs = 50;
-    this.lossWarnRate = 0.05;         // raised to 5% — Tailscale/DERP can have 2-4% baseline
-    this.lossCriticalRate = 0.10;     // >10% packet loss = critical
+    // Tuning — designed for internet/Tailscale connections (30-50ms baseline jitter)
+    this.degradeCooldownMs = 4000;    // 4s between degrade steps (prevent cascade)
+    this.recoverCooldownMs = 5000;    // 5s between recover steps
+    this.recoverWaitMs = 5000;        // 5s continuous good health before step-up
+    this.startupGraceMs = 12000;      // 12s grace after stream start — encoder ramps up
+
+    // Jitter thresholds — internet has 30-50ms baseline, only react to real congestion
+    this.jitterWarnMs = 65;
+    this.jitterCriticalMs = 100;
+
+    // Loss thresholds — some connections have 2-4% baseline
+    this.lossWarnRate = 0.05;
+    this.lossCriticalRate = 0.10;
+
+    // Recovery probe: if stuck at MIN for this long, force a step-up attempt
+    this.recoveryProbeMs = 30000;     // 30s at MIN → try stepping up
   }
 
-  get _degradeCooldownMs() { return this.gameMode ? 1200 : this.degradeCooldownMs; }
+  get tiers() { return DEGRADATION_TIERS; }
 
-  get _recoverCooldownMs() { return this.gameMode ? 1200 : this.recoverCooldownMs; }
-
-  get _recoverWaitMs() { return this.gameMode ? 1500 : this.recoverWaitMs; }
-
-  get _tiers() { return this.gameMode ? GAME_DEGRADATION_TIERS : DEGRADATION_TIERS; }
-
-  get currentTier() { return this._tiers[this.tierIndex]; }
+  get currentTier() { return this.tiers[this.tierIndex]; }
 
   get effectiveBitrate() {
     return Math.max(this.floor, Math.round(this.profileMaxBitrate * this.currentTier.bitratePct));
@@ -307,6 +297,8 @@ class AdaptiveQualityController {
     this.profileMaxBitrate = bitrate;
     this.profileMaxFps = fps || 60;
     this.tierIndex = 0; // reset to max quality on profile change
+    this._streamStartTime = Date.now();
+    this._stuckAtMinSince = 0;
     this._applyTier();
   }
 
@@ -377,34 +369,38 @@ class AdaptiveQualityController {
       logger.debug(diag);
     }
 
+    // Startup grace: don't degrade while encoder is ramping up
+    const inGrace = (now - this._streamStartTime) < this.startupGraceMs;
+
     if (assessment === 'source-stall') {
       // Source stopped producing — don't degrade, just log
       if (this._evalCounter % 3 === 0) {
         logger.warn('[ABR] Source stall detected (all viewers 0fps/0bps) — holding tier ' + this.currentTier.label);
       }
-    } else if (assessment === 'critical') {
-      if (now - this.lastDegradeTime >= this._degradeCooldownMs) {
+    } else if (!inGrace && assessment === 'critical') {
+      if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
         this._stepDown(2); // emergency: skip 2 tiers
+        this._stuckAtMinSince = 0;
       }
-    } else if (assessment === 'warning') {
-      if (now - this.lastDegradeTime >= this._degradeCooldownMs) {
+    } else if (!inGrace && assessment === 'warning') {
+      if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
         this._stepDown(1);
+        this._stuckAtMinSince = 0;
       }
     } else if (assessment === 'good') {
       if (this.tierIndex > 0) {
         if (!this.goodHealthStart) {
           this.goodHealthStart = now;
-        } else if (now - this.goodHealthStart >= this._recoverWaitMs &&
-                   now - this.lastRecoverTime >= this._recoverCooldownMs) {
+        } else if (now - this.goodHealthStart >= this.recoverWaitMs &&
+                   now - this.lastRecoverTime >= this.recoverCooldownMs) {
           // Gate: only step up if actual bitrate can support the next tier
-          const nextTier = this._tiers[this.tierIndex - 1];
+          const nextTier = this.tiers[this.tierIndex - 1];
           const neededMbps = (this.profileMaxBitrate * nextTier.bitratePct) / 1e6;
           const currentMbps = this._getMinViewerBitrate();
-          if (currentMbps >= neededMbps * (this.gameMode ? 0.45 : 0.5)) {
+          if (currentMbps >= neededMbps * 0.35) {
             const veryGood = this._isVeryGoodHealth();
             this._stepUp(veryGood ? 2 : 1);
           } else {
-            // Not enough bandwidth headroom — hold position, don't reset goodHealthStart
             if (this._evalCounter % 3 === 0) {
               logger.debug('[ABR] Recovery gated: need ' + neededMbps.toFixed(1) + 'Mbps, actual=' + currentMbps.toFixed(1) + 'Mbps');
             }
@@ -412,7 +408,23 @@ class AdaptiveQualityController {
         }
       } else {
         this.goodHealthStart = 0;
+        this._stuckAtMinSince = 0;
       }
+    }
+
+    // Recovery probe: if stuck at bottom tier too long, force a step-up attempt
+    if (this.tierIndex === this.tiers.length - 1) {
+      if (!this._stuckAtMinSince) {
+        this._stuckAtMinSince = now;
+      } else if (now - this._stuckAtMinSince >= this.recoveryProbeMs &&
+                 assessment !== 'critical') {
+        logger.info('[ABR] Recovery probe — stuck at MIN for ' +
+          ((now - this._stuckAtMinSince) / 1000).toFixed(0) + 's, trying step up');
+        this._stepUp(1);
+        this._stuckAtMinSince = now; // reset so we don't probe again immediately
+      }
+    } else {
+      this._stuckAtMinSince = 0;
     }
   }
 
@@ -434,8 +446,8 @@ class AdaptiveQualityController {
       const baseline = health.baselineSamples >= 3 ? health.baselineFps : recentAvg;
       const avgJitter = health.jitterSamples.slice(-3).reduce((a, b) => a + b, 0) / Math.min(health.jitterSamples.length, 3);
 
-      const crashThreshold = this.gameMode ? 0.55 : 0.3;
-      const warnThreshold = this.gameMode ? 0.85 : 0.6;
+      const crashThreshold = 0.3;
+      const warnThreshold = 0.6;
 
       if (recent.some(f => f === 0)) hasZeroFps = true;
       if (baseline > 5 && recentAvg < baseline * crashThreshold) hasFpsCrash = true;
@@ -455,16 +467,13 @@ class AdaptiveQualityController {
     }
 
     // Critical: zero fps OR fps crash OR extreme jitter OR extreme loss
-    const jitterCritical = this.gameMode ? 35 : this.jitterCriticalMs;
-    const jitterWarn = this.gameMode ? 18 : this.jitterWarnMs;
-
-    if (hasZeroFps || hasFpsCrash || worstJitter > jitterCritical || worstLoss > this.lossCriticalRate) {
+    if (hasZeroFps || hasFpsCrash || worstJitter > this.jitterCriticalMs || worstLoss > this.lossCriticalRate) {
       return 'critical';
     }
-    // Warning: fps drop OR high jitter OR notable loss  
-    // Loss alone only triggers warning if combined with elevated jitter (>20ms)
-    if (hasFpsDrop || worstJitter > jitterWarn ||
-        (worstLoss > this.lossWarnRate && worstJitter > 20)) {
+    // Warning: fps drop OR high jitter OR notable loss
+    // Loss alone only triggers warning if combined with elevated jitter (>40ms)
+    if (hasFpsDrop || worstJitter > this.jitterWarnMs ||
+        (worstLoss > this.lossWarnRate && worstJitter > 40)) {
       return 'warning';
     }
     return 'good';
@@ -481,7 +490,7 @@ class AdaptiveQualityController {
       const jRecent = health.jitterSamples.slice(-3);
       const jAvg = jRecent.reduce((a, b) => a + b, 0) / jRecent.length;
       if (baseline > 5 && recentAvg < baseline * 0.95) return false;
-      if (jAvg > (this.gameMode ? 10 : 8)) return false;
+      if (jAvg > 30) return false;
       if (health.lossRate > 0.01) return false;
     }
 
@@ -498,7 +507,7 @@ class AdaptiveQualityController {
 
   _stepDown(steps) {
     const prevTier = this.tierIndex;
-    this.tierIndex = Math.min(this._tiers.length - 1, this.tierIndex + steps);
+    this.tierIndex = Math.min(this.tiers.length - 1, this.tierIndex + steps);
     if (this.tierIndex !== prevTier) {
       // Reset baselines since FPS target changed — prevents cross-tier confusion
       for (const [, health] of this.viewerHealth) {
@@ -510,6 +519,14 @@ class AdaptiveQualityController {
       logger.warn('[ABR] DEGRADE tier ' + prevTier + '->' + this.tierIndex + ' (' + t.label + ') ' +
         (this.effectiveBitrate / 1e6).toFixed(1) + 'Mbps @' + this.effectiveFps + 'fps' +
         (t.scaleDown > 1 ? ' scale=' + t.scaleDown + 'x' : ''));
+      // Session log for ABR analysis
+      if (window.electron?.sessionLog) {
+        window.electron.sessionLog('abr-degrade', {
+          from: prevTier, to: this.tierIndex, label: t.label,
+          bitrateMbps: (this.effectiveBitrate / 1e6).toFixed(1),
+          fps: this.effectiveFps, scaleDown: t.scaleDown,
+        });
+      }
     }
     this.lastDegradeTime = Date.now();
     this.goodHealthStart = 0;
@@ -529,6 +546,14 @@ class AdaptiveQualityController {
       logger.info('[ABR] RECOVER tier ' + prevTier + '->' + this.tierIndex + ' (' + t.label + ') ' +
         (this.effectiveBitrate / 1e6).toFixed(1) + 'Mbps @' + this.effectiveFps + 'fps' +
         (t.scaleDown > 1 ? ' scale=' + t.scaleDown + 'x' : ''));
+      // Session log for ABR analysis
+      if (window.electron?.sessionLog) {
+        window.electron.sessionLog('abr-recover', {
+          from: prevTier, to: this.tierIndex, label: t.label,
+          bitrateMbps: (this.effectiveBitrate / 1e6).toFixed(1),
+          fps: this.effectiveFps, scaleDown: t.scaleDown,
+        });
+      }
     }
     this.lastRecoverTime = Date.now();
     this.goodHealthStart = 0;
@@ -583,19 +608,12 @@ class StreamerApp {
       this._prevBytesSent = 0;
       this._prevFramesEncoded = 0;
       this._prevStatsTimestamp = 0;
-      this._nativeVideoTrack = null;
-      this._nativeVideoWriter = null;
-      this._nativeFrameWritePending = false;
-      this._nativeGameHwnd = null;
       this._nativeGamePid = null;
-      this._nativeFrameTimestampUs = 0;
       this._nativeGameAudioTrack = null;
       this._nativeGameAudioContext = null;
       this._nativeGameAudioNode = null;
       this._nativeGameAudioDestination = null;
       this._nativeGameAudioQueue = [];
-      this._enableExperimentalWgc = false;
-      this._useCustomGameAbr = true;
       this.abr = new AdaptiveQualityController(this);
       this._bitrateCapMbps = null; // null = use profile default
 
@@ -615,8 +633,6 @@ class StreamerApp {
     const clearLogsBtn = document.getElementById('toggleDebug');
     const qualityProfile = document.getElementById('qualityProfile');
     const includeAudio = document.getElementById('includeAudio');
-    const enableExperimentalWgc = document.getElementById('enableExperimentalWgc');
-    const useCustomGameAbr = document.getElementById('useCustomGameAbr');
 
     if (connectBtn) connectBtn.addEventListener('click', () => this.connect());
     if (refreshBtn) refreshBtn.addEventListener('click', () => this.loadCaptureSources());
@@ -652,32 +668,6 @@ class StreamerApp {
         this.includeAudio = includeAudio.checked;
         logger.info('Source audio ' + (this.includeAudio ? 'enabled' : 'disabled'));
       });
-    }
-
-    if (enableExperimentalWgc) {
-      enableExperimentalWgc.checked = this._enableExperimentalWgc;
-      enableExperimentalWgc.addEventListener('change', () => {
-        this._enableExperimentalWgc = enableExperimentalWgc.checked;
-        logger.info('[WGC] Experimental native capture ' + (this._enableExperimentalWgc ? 'enabled' : 'disabled'));
-      });
-    }
-
-    if (useCustomGameAbr) {
-      useCustomGameAbr.checked = this._useCustomGameAbr;
-      useCustomGameAbr.addEventListener('change', () => {
-        this._useCustomGameAbr = useCustomGameAbr.checked;
-        this._syncAbrMode();
-        logger.info('[ABR] Custom game ABR ' + (this._useCustomGameAbr ? 'enabled' : 'disabled'));
-      });
-    }
-  }
-
-  _syncAbrMode() {
-    this.abr.gameMode = this._isGameCapture && this._useCustomGameAbr;
-    if (this.isBroadcasting) {
-      const profile = this.getActiveQualityProfile();
-      this.abr.setProfile(profile.maxBitrate, profile.maxFrameRate);
-      logger.info('[ABR] Mode=' + (this.abr.gameMode ? 'game-optimised' : 'default') + ' for current stream');
     }
   }
 
@@ -909,16 +899,6 @@ class StreamerApp {
       // Cache sources for later lookup (e.g. auto screen-capture for games)
       this._cachedSources = sources;
 
-      // Check native capture availability once
-      if (this._nativeCaptureAvailable == null) {
-        try {
-          this._nativeCaptureAvailable = await window.electron.isNativeCaptureAvailable();
-          if (this._nativeCaptureAvailable) logger.info('[GAME] Native WGC game capture available');
-        } catch (_) {
-          this._nativeCaptureAvailable = false;
-        }
-      }
-
       const gameCount = sources.filter(s => s.isGame).length;
       if (gameCount > 0) {
         logger.info('[GAME] Detected ' + gameCount + ' game source(s)');
@@ -967,17 +947,26 @@ class StreamerApp {
       logger.info('Starting stream: ' + sourceName + (isGame ? ' [GAME MODE]' : ''));
 
       this._isGameCapture = isGame;
-      this._nativeGameHwnd = gameHwnd;
       this._nativeGamePid = gamePid;
-      this.abr.gameMode = isGame && this._useCustomGameAbr;
       const isWindowCapture = sourceId.startsWith('window:');
 
+      // For games detected as window sources, switch to screen capture (DXGI)
+      // immediately. Chromium's WGC window capture cannot reliably grab
+      // DirectX/Vulkan game surfaces — it often captures the window behind
+      // the game instead.
       if (isGame && isWindowCapture) {
-        logger.info('[GAME] Trying direct window capture first (preferred: no cursor, no desktop bleed)');
+        logger.info('[GAME] Window capture unreliable for DX/Vulkan games — switching to screen capture (DXGI)');
+        const screenId = await this._findScreenSource();
+        if (screenId) {
+          sourceId = screenId;
+          this._gameUsedScreenFallback = true;
+        } else {
+          logger.warn('[GAME] No screen source found, falling back to window capture');
+        }
       }
 
       this._lastSourceId = sourceId;
-      this._gameUsedScreenFallback = false;
+      if (!this._gameUsedScreenFallback) this._gameUsedScreenFallback = false;
 
       if (sourceId.startsWith('window:') && window.electron?.prepareForCapture) {
         logger.info('Minimizing streamer window before window capture');
@@ -1037,16 +1026,9 @@ class StreamerApp {
           }
         }
 
-        // NOTE: Do NOT upgrade to native WGC capture here. Chromium's built-in
-        // WGC (enabled via --enable-features=WebRtcAllowWgcWindowCapturer) handles
-        // DirectX/Vulkan game capture internally with zero-copy GPU paths, which
-        // is far more efficient than the native addon's raw-pixel IPC pipeline.
-        // The native WGC path is kept for future use but disabled by default.
-
         // For game window captures, schedule an early frame-production check.
-        // If the window capture isn't producing frames (e.g. exclusive fullscreen
-        // which WGC/GDI can't capture), automatically fall back to screen capture
-        // while keeping process-isolated audio.
+        // If the window capture isn't producing frames (e.g. exclusive fullscreen),
+        // automatically fall back to screen capture while keeping process-isolated audio.
         if (isGame && isWindowCapture && this.videoProducer) {
           this._scheduleGameCaptureFallbackCheck();
         }
@@ -1106,6 +1088,14 @@ class StreamerApp {
       this._startSourceHealthCheck();
       logger.info('[SFU] Stream live — server forwards to all viewers (single encoder!)');
 
+      if (window.electron?.sessionLog) {
+        window.electron.sessionLog('stream-start', {
+          sourceId, sourceName, isGame, gameHwnd, gamePid,
+          profile: this.captureProfile,
+          captureMethod: this._gameUsedScreenFallback ? 'screen-dxgi' : (sourceId.startsWith('window:') ? 'window-wgc' : 'screen'),
+        });
+      }
+
     } catch (error) {
       logger.error('Failed to start stream: ' + error.message);
       this.setStatus('Stream Error', 'red');
@@ -1127,8 +1117,7 @@ class StreamerApp {
     // NOTE: Do NOT add cursor constraints to the mandatory block here.
     // Unknown mandatory properties (like cursor: 'never') can cause Chromium
     // to fall back from WGC to GDI-based capture, which cannot capture
-    // DirectX/Vulkan game surfaces. Cursor suppression is handled by the
-    // native WGC capture path (IsCursorCaptureEnabled = false).
+    // DirectX/Vulkan game surfaces.
 
     const videoConstraints = { mandatory };
 
@@ -1211,6 +1200,19 @@ class StreamerApp {
         });
 
         this.updateStatsDisplay(bitrateMbps, fps);
+
+        // Periodic stats snapshot (every 5s)
+        if (bitrateMbps !== null && window.electron?.sessionLog) {
+          this._statsTickCount = (this._statsTickCount || 0) + 1;
+          if (this._statsTickCount % 5 === 0) {
+            window.electron.sessionLog('stats-snapshot', {
+              bitrateMbps: +bitrateMbps.toFixed(2), fps,
+              abrTier: this.abr.tierIndex,
+              abrLabel: this.abr.tiers?.[this.abr.tierIndex]?.label,
+              viewers: this.viewers.size,
+            });
+          }
+        }
 
         // Run ABR evaluation every stats tick
         this.abr.evaluate();
@@ -1350,8 +1352,7 @@ class StreamerApp {
     }
 
     try {
-      // Tear down native WGC (it failed anyway)
-      this._teardownNativeWgc();
+      // Get screen capture stream (video only — audio via process loopback)
 
       // Get screen capture stream (video only — audio via process loopback)
       const savedGameFlag = this._isGameCapture;
@@ -1377,6 +1378,9 @@ class StreamerApp {
       this._gameUsedScreenFallback = true;
 
       logger.info('[GAME] Switched to screen capture (DXGI) — game in exclusive fullscreen. Audio stays on process loopback.');
+      if (window.electron?.sessionLog) {
+        window.electron.sessionLog('game-fallback-screen', { screenId });
+      }
     } catch (e) {
       logger.error('[GAME] Screen capture fallback failed: ' + e.message);
     }
@@ -1385,18 +1389,12 @@ class StreamerApp {
   stopStreaming() {
     logger.info('Stopping stream...');
 
-    // Stop health check, fallback timer, and native game capture
+    // Stop health check, fallback timer, and native game audio
     this._stopSourceHealthCheck();
     if (this._gameFallbackTimer) { clearTimeout(this._gameFallbackTimer); this._gameFallbackTimer = null; }
-    this._teardownNativeWgc();
     this._teardownNativeGameAudio();
-    if (this._isGameCapture && window.electron?.stopNativeCapture) {
-      window.electron.stopNativeCapture().catch(() => {});
-    }
     this._isGameCapture = false;
-    this._nativeGameHwnd = null;
     this._nativeGamePid = null;
-    this.abr.gameMode = false;
     this.abr.tierIndex = 0;
 
     if (this.videoProducer) {
@@ -1421,6 +1419,10 @@ class StreamerApp {
     this.viewers.clear();
     this.updateViewersList();
     logger.info('Stream stopped');
+
+    if (window.electron?.sessionLog) {
+      window.electron.sessionLog('stream-stop', {});
+    }
 
     if (window.electron?.restoreAfterCapture) {
       window.electron.restoreAfterCapture().catch((error) => {
@@ -1585,93 +1587,6 @@ class StreamerApp {
     }
     this._nativeGameAudioDestination = null;
     this._nativeGameAudioQueue = [];
-  }
-
-  async _upgradeProducerToNativeWgc(gameHwnd, fallbackTrack, fallbackStream) {
-    const NativeGenerator = window.MediaStreamTrackGenerator || window.VideoTrackGenerator;
-    if (!NativeGenerator || typeof window.VideoFrame !== 'function') {
-      logger.warn('[WGC] MediaStreamTrackGenerator/VideoFrame unavailable in this Electron runtime');
-      return;
-    }
-    if (!window.electron?.onWgcFrame || !window.electron?.startNativeCapture || !this.videoProducer?.rtpSender) {
-      logger.warn('[WGC] Native frame bridge unavailable; staying on Chromium capture');
-      return;
-    }
-
-    try {
-      const nativeTrack = new NativeGenerator({ kind: 'video' });
-      const writer = nativeTrack.writable.getWriter();
-      const profile = this.getActiveQualityProfile();
-
-      this._nativeVideoTrack = nativeTrack;
-      this._nativeVideoWriter = writer;
-      this._nativeFrameWritePending = false;
-      this._nativeFrameTimestampUs = 0;
-
-      window.electron.onWgcFrame(async (buffer, meta) => {
-        if (!this._nativeVideoWriter || this._nativeFrameWritePending) return;
-        try {
-          this._nativeFrameWritePending = true;
-          const pixels = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-          this._nativeFrameTimestampUs += Math.round(1000000 / Math.max(1, profile.maxFrameRate || 60));
-          const frame = new VideoFrame(pixels, {
-            format: 'BGRA',
-            codedWidth: meta.width,
-            codedHeight: meta.height,
-            timestamp: this._nativeFrameTimestampUs,
-          });
-          await this._nativeVideoWriter.write(frame);
-          frame.close();
-        } catch (error) {
-          if (!this._wgcWriteWarned) {
-            this._wgcWriteWarned = true;
-            logger.warn('[WGC] Native frame write failed: ' + error.message);
-          }
-        } finally {
-          this._nativeFrameWritePending = false;
-        }
-      });
-
-      const nativeResult = await window.electron.startNativeCapture({
-        hwnd: gameHwnd,
-        width: profile.maxWidth,
-        height: profile.maxHeight,
-        fps: profile.maxFrameRate,
-      });
-
-      if (!nativeResult?.success) {
-        logger.warn('[WGC] Native capture start failed: ' + (nativeResult?.reason || 'unknown'));
-        this._teardownNativeWgc();
-        return;
-      }
-
-      await this.videoProducer.rtpSender.replaceTrack(nativeTrack);
-      if (fallbackStream?.removeTrack) {
-        fallbackStream.removeTrack(fallbackTrack);
-      }
-      fallbackTrack.stop();
-      logger.info('[WGC] Native track generator attached — producer switched off Chromium capture');
-    } catch (error) {
-      logger.warn('[WGC] Native pipeline setup failed: ' + error.message);
-      this._teardownNativeWgc();
-    }
-  }
-
-  _teardownNativeWgc() {
-    if (window.electron?.removeWgcFrameListener) {
-      window.electron.removeWgcFrameListener();
-    }
-    if (this._nativeVideoWriter) {
-      this._nativeVideoWriter.close().catch(() => {});
-      this._nativeVideoWriter = null;
-    }
-    if (this._nativeVideoTrack) {
-      this._nativeVideoTrack.stop();
-      this._nativeVideoTrack = null;
-    }
-    this._nativeFrameWritePending = false;
-    this._nativeFrameTimestampUs = 0;
-    this._wgcWriteWarned = false;
   }
 
   updateViewersList() {

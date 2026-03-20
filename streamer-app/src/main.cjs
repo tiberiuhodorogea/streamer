@@ -1,23 +1,79 @@
 const { app, BrowserWindow, ipcMain, desktopCapturer } = require('electron');
-const { execFileSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
 // Force Chromium to use Windows Graphics Capture (WGC) for window capture.
 // Without this, Chromium may fall back to GDI-based capture which cannot
 // capture DirectX/Vulkan game surfaces.
 app.commandLine.appendSwitch('enable-features',
   'WebRtcAllowWgcWindowCapturer,WebRtcAllowWgcScreenCapturer');
-app.commandLine.appendSwitch('enable-blink-features', 'BreakoutBox');
 
 let mainWindow;
 const APP_CAPTURE_NAMES = new Set(['Streamer Studio', 'P2P Stream - Streamer']);
 const SHOULD_OPEN_DEVTOOLS = process.env.STREAMER_DEVTOOLS === '1';
 
+// ========== SESSION LOGGING (writes to same session dir as signaling server) ==========
+const repoRoot = path.resolve(__dirname, '..', '..');
+const sessionStartedAt = new Date();
+const sessionId = sessionStartedAt.toISOString().replace(/[:.]/g, '-');
+let gitCommit = 'unknown';
+try {
+  gitCommit = execSync('git rev-parse --short HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
+} catch {}
+
+// Find the latest session directory created by the signaling server, or create our own
+let streamerSessionDir;
+const sessionsRoot = path.join(repoRoot, 'logs', 'sessions');
+try {
+  const dirs = fs.readdirSync(sessionsRoot)
+    .filter(d => fs.statSync(path.join(sessionsRoot, d)).isDirectory())
+    .sort()
+    .reverse();
+  // Use a session dir created within the last 60 seconds (signaling server likely just started)
+  const recent = dirs.find(d => {
+    const meta = path.join(sessionsRoot, d, 'session.meta.json');
+    if (!fs.existsSync(meta)) return false;
+    const mtime = fs.statSync(meta).mtimeMs;
+    return (Date.now() - mtime) < 60000;
+  });
+  if (recent) {
+    streamerSessionDir = path.join(sessionsRoot, recent);
+  }
+} catch {}
+
+if (!streamerSessionDir) {
+  streamerSessionDir = path.join(sessionsRoot, `${sessionId}-${gitCommit}`);
+  fs.mkdirSync(streamerSessionDir, { recursive: true });
+}
+
+const streamerLogPath = path.join(streamerSessionDir, 'streamer.jsonl');
+console.log('[SESSION] Streamer logging to ' + streamerLogPath);
+
+function appendStreamerLog(type, payload) {
+  try {
+    fs.appendFileSync(streamerLogPath, JSON.stringify({
+      ts: new Date().toISOString(),
+      type,
+      payload,
+    }) + '\n');
+  } catch {}
+}
+
+appendStreamerLog('streamer-started', {
+  gitCommit,
+  electronVersion: process.versions.electron,
+  chromeVersion: process.versions.chrome,
+  nodeVersion: process.versions.node,
+  platform: process.platform,
+  arch: process.arch,
+});
+
 // ========== NATIVE ADDON (optional) ==========
 let nativeCapture = null;
 try {
   nativeCapture = require(path.join(__dirname, '..', 'native'));
-  console.log('[NATIVE] Game capture addon loaded — WGC capture available');
+  console.log('[NATIVE] Game capture addon loaded — game detection + process audio available');
 } catch (_) {
   console.log('[NATIVE] Native addon not available — using PowerShell game detection + optimised screen capture');
 }
@@ -110,7 +166,6 @@ const createWindow = () => {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
       contextIsolation: true,
-      enableRemoteModule: false,
       sandbox: false // Disable sandbox to allow screen capture
     }
   });
@@ -134,10 +189,20 @@ const createWindow = () => {
   }
 };
 
-app.on('ready', createWindow);
+app.whenReady().then(createWindow);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// IPC Handler: Write a structured log entry to the session JSONL file
+ipcMain.handle('session-log', async (_event, { type, payload }) => {
+  appendStreamerLog(type, payload);
+});
+
+// IPC Handler: Get the session directory path
+ipcMain.handle('get-session-dir', async () => {
+  return streamerSessionDir;
 });
 
 // IPC Handler: Get available screens and windows for capture
@@ -185,52 +250,9 @@ ipcMain.handle('get-capture-sources', async () => {
   }
 });
 
-// IPC Handler: Check if native game capture is available
-ipcMain.handle('native-capture-available', () => {
-  return !!(nativeCapture && typeof nativeCapture.startCapture === 'function');
-});
-
+// IPC Handler: Check if native process audio capture is available
 ipcMain.handle('native-process-audio-available', () => {
   return !!(nativeCapture && typeof nativeCapture.startProcessAudioCapture === 'function');
-});
-
-// IPC Handler: Start native game capture with frame delivery
-ipcMain.handle('start-native-capture', async (_event, { hwnd, width, height, fps }) => {
-  if (!nativeCapture || typeof nativeCapture.startCapture !== 'function') {
-    return { success: false, reason: 'not-available' };
-  }
-  try {
-    // Register frame callback — forwards BGRA frames to renderer via IPC
-    if (typeof nativeCapture.registerFrameCallback === 'function') {
-      nativeCapture.registerFrameCallback((pixels, meta) => {
-        try {
-          if (!mainWindow || mainWindow.isDestroyed()) return;
-          mainWindow.webContents.send('wgc-frame', pixels.buffer, meta);
-        } catch (error) {
-          console.warn('[NATIVE] WGC frame forwarding failed:', error.message);
-        }
-      });
-      console.log('[NATIVE] Frame callback registered — frames will be forwarded to renderer');
-    }
-
-    nativeCapture.startCapture(parseInt(hwnd), width, height, fps || 60);
-    console.log('[NATIVE] WGC capture started for HWND ' + hwnd + ' (' + width + 'x' + height + '@' + (fps || 60) + ')');
-    return { success: true };
-  } catch (err) {
-    console.error('[NATIVE] Start failed:', err.message);
-    return { success: false, reason: err.message };
-  }
-});
-
-// IPC Handler: Stop native game capture
-ipcMain.handle('stop-native-capture', async () => {
-  if (!nativeCapture) return { success: false };
-  try {
-    if (typeof nativeCapture.stopCapture === 'function') nativeCapture.stopCapture();
-    return { success: true };
-  } catch (err) {
-    return { success: false, reason: err.message };
-  }
 });
 
 ipcMain.handle('start-native-process-audio', async (_event, { pid }) => {

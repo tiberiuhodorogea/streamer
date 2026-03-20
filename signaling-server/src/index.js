@@ -16,23 +16,49 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..');
-const sessionLogDir = path.join(repoRoot, 'logs', 'sessions');
-fs.mkdirSync(sessionLogDir, { recursive: true });
 
+// ============================================
+// SESSION LOGGING
+// All session data goes to logs/sessions/<sessionId>/
+// Each session gets: session.meta.json, signaling.jsonl, summary on close
+// ============================================
 const sessionStartedAt = new Date();
 const sessionId = sessionStartedAt.toISOString().replace(/[:.]/g, '-');
 let gitCommit = 'unknown';
 try {
   gitCommit = execSync('git rev-parse --short HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
 } catch {}
-const sessionLogPath = path.join(sessionLogDir, `${sessionId}-${gitCommit}.jsonl`);
-const sessionMetaPath = path.join(sessionLogDir, `${sessionId}-${gitCommit}.meta.json`);
+
+const sessionDir = path.join(repoRoot, 'logs', 'sessions', `${sessionId}-${gitCommit}`);
+fs.mkdirSync(sessionDir, { recursive: true });
+
+const sessionLogPath = path.join(sessionDir, 'signaling.jsonl');
+const sessionMetaPath = path.join(sessionDir, 'session.meta.json');
+
+// Session-level aggregated stats for comparison
+const sessionStats = {
+  totalViewerJoins: 0,
+  totalViewerLeaves: 0,
+  totalQualityReports: 0,
+  totalStreamerRegistrations: 0,
+  peakViewerCount: 0,
+  qualityReportSamples: [],   // last N for summary
+  abrEvents: [],               // ABR tier changes
+  transportIssues: [],          // DTLS failures, transport errors
+  startedAt: sessionStartedAt.toISOString(),
+  endedAt: null,
+};
+
 fs.writeFileSync(sessionMetaPath, JSON.stringify({
   sessionId,
   gitCommit,
   startedAt: sessionStartedAt.toISOString(),
   server: 'signaling-server',
   announcedIp: process.env.ANNOUNCED_IP || null,
+  nodeVersion: process.version,
+  platform: process.platform,
+  arch: process.arch,
+  sessionDir,
 }, null, 2));
 
 function appendSessionLog(type, payload) {
@@ -42,6 +68,45 @@ function appendSessionLog(type, payload) {
     payload,
   }) + '\n');
 }
+
+function writeSessionSummary() {
+  sessionStats.endedAt = new Date().toISOString();
+  const durationMs = Date.now() - sessionStartedAt.getTime();
+  sessionStats.durationSec = Math.round(durationMs / 1000);
+
+  // Compute quality report aggregates
+  if (sessionStats.qualityReportSamples.length > 0) {
+    const samples = sessionStats.qualityReportSamples;
+    const avgFps = samples.reduce((a, b) => a + (b.fps || 0), 0) / samples.length;
+    const avgBitrate = samples.reduce((a, b) => a + (b.bitrateMbps || 0), 0) / samples.length;
+    const avgJitter = samples.filter(s => s.jitterMs != null).reduce((a, b) => a + b.jitterMs, 0) / Math.max(1, samples.filter(s => s.jitterMs != null).length);
+    const avgLoss = samples.filter(s => s.lossRate != null).reduce((a, b) => a + b.lossRate, 0) / Math.max(1, samples.filter(s => s.lossRate != null).length);
+    const minFps = Math.min(...samples.map(s => s.fps || 0));
+    const maxFps = Math.max(...samples.map(s => s.fps || 0));
+    const p95Jitter = samples.filter(s => s.jitterMs != null).map(s => s.jitterMs).sort((a, b) => a - b)[Math.floor(samples.filter(s => s.jitterMs != null).length * 0.95)] || 0;
+
+    sessionStats.qualityAggregate = {
+      sampleCount: samples.length,
+      avgFps: Number(avgFps.toFixed(1)),
+      minFps,
+      maxFps,
+      avgBitrateMbps: Number(avgBitrate.toFixed(2)),
+      avgJitterMs: Number(avgJitter.toFixed(1)),
+      p95JitterMs: Number(p95Jitter.toFixed(1)),
+      avgLossRate: Number(avgLoss.toFixed(4)),
+    };
+  }
+
+  // Don't write the raw samples array to the summary (too large)
+  const summary = { ...sessionStats };
+  delete summary.qualityReportSamples;
+
+  const summaryPath = path.join(sessionDir, 'session.summary.json');
+  fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
+  console.log('[SESSION] Summary written to ' + summaryPath);
+}
+
+console.log('[SESSION] Logging to ' + sessionDir);
 
 // ============================================
 // CONFIGURATION
@@ -76,7 +141,7 @@ const MEDIA_CODECS = [
     clockRate: 90000,
     parameters: {
       'packetization-mode': 1,
-      'profile-level-id': '42e01f',
+      'profile-level-id': '640032',
       'level-asymmetry-allowed': 1,
     },
   },
@@ -305,6 +370,9 @@ async function handleStreamerRegister(clientId, data, ws) {
     client.role = 'streamer';
     client.roomId = clientId;
 
+    sessionStats.totalStreamerRegistrations++;
+    appendSessionLog('streamer-registered', { clientId, name });
+
     send(ws, 'registered', {
       routerRtpCapabilities: router.rtpCapabilities,
     });
@@ -448,6 +516,13 @@ async function handleViewerJoin(clientId, data, ws) {
   });
 
   send(room.streamer.ws, 'viewer-joined', { viewerId: clientId, viewerName });
+
+  sessionStats.totalViewerJoins++;
+  const currentViewerCount = room.viewers.size;
+  if (currentViewerCount > sessionStats.peakViewerCount) {
+    sessionStats.peakViewerCount = currentViewerCount;
+  }
+  appendSessionLog('viewer-joined', { clientId, viewerName, streamerId, currentViewerCount });
 
   send(ws, 'joined', {
     routerRtpCapabilities: room.router.rtpCapabilities,
@@ -615,6 +690,21 @@ function handleViewerQualityReport(clientId, data) {
     lossRate: data.lossRate,
   });
 
+  // Track for session summary
+  sessionStats.totalQualityReports++;
+  sessionStats.qualityReportSamples.push({
+    fps: data.fps,
+    bitrateMbps: data.bitrateMbps,
+    frameWidth: data.frameWidth,
+    frameHeight: data.frameHeight,
+    jitterMs: data.jitterMs,
+    lossRate: data.lossRate,
+  });
+  // Keep last 10000 samples max
+  if (sessionStats.qualityReportSamples.length > 10000) {
+    sessionStats.qualityReportSamples.splice(0, sessionStats.qualityReportSamples.length - 10000);
+  }
+
   send(room.streamer.ws, 'viewer-quality-report', {
     viewerId: clientId,
     fps: data.fps,
@@ -637,6 +727,7 @@ function handleDisconnect(clientId) {
   if (client.role === 'streamer') {
     const room = rooms.get(clientId);
     if (room) {
+      appendSessionLog('streamer-disconnected', { clientId, name: room.streamer.name });
       for (const [viewerId, viewer] of room.viewers) {
         send(viewer.ws, 'streamer-disconnected', {});
         if (viewer.consumerTransport) viewer.consumerTransport.close();
@@ -661,6 +752,8 @@ function handleDisconnect(clientId) {
         if (viewer.consumerTransport) viewer.consumerTransport.close();
         room.viewers.delete(clientId);
         send(room.streamer.ws, 'viewer-left', { viewerId: clientId });
+        sessionStats.totalViewerLeaves++;
+        appendSessionLog('viewer-left', { clientId, viewerName: viewer.name });
         console.log('[SFU] Viewer ' + viewer.name + ' removed from room');
       }
     }
@@ -673,6 +766,7 @@ function handleDisconnect(clientId) {
 
 function shutdown() {
   console.log('\n[Server] Shutting down gracefully...');
+  writeSessionSummary();
   clearInterval(heartbeatTimer);
   wss.clients.forEach((ws) => ws.terminate());
   if (worker) worker.close();

@@ -26,46 +26,6 @@ function enumGameWindows() {
   return [];
 }
 
-/** @returns {boolean} */
-function isSupported() {
-  if (addon && typeof addon.isSupported === 'function') {
-    return addon.isSupported();
-  }
-  return false;
-}
-
-/**
- * Start capturing a window by HWND using Windows Graphics Capture.
- * @param {number} hwnd
- * @param {number} width
- * @param {number} height
- * @param {number} fps
- */
-function startCapture(hwnd, width, height, fps) {
-  if (!addon || typeof addon.startCapture !== 'function') {
-    throw new Error('Native capture addon not available');
-  }
-  return addon.startCapture(hwnd, width, height, fps);
-}
-
-function stopCapture() {
-  if (addon && typeof addon.stopCapture === 'function') {
-    return addon.stopCapture();
-  }
-}
-
-/**
- * Register a callback to receive captured frames.
- * Callback signature: (buffer: Uint8Array, meta: {width, height, frameIndex}) => void
- * Called on the Node.js main thread each time WGC delivers a new frame.
- */
-function registerFrameCallback(callback) {
-  if (!addon || typeof addon.registerFrameCallback !== 'function') {
-    throw new Error('Native capture addon not available');
-  }
-  return addon.registerFrameCallback(callback);
-}
-
 function isProcessAudioSupported() {
   return !!(addon && typeof addon.isProcessAudioSupported === 'function' && addon.isProcessAudioSupported());
 }
@@ -92,10 +52,6 @@ function registerAudioCallback(callback) {
 
 module.exports = {
   enumGameWindows,
-  isSupported,
-  startCapture,
-  stopCapture,
-  registerFrameCallback,
   isProcessAudioSupported,
   startProcessAudioCapture,
   stopProcessAudioCapture,

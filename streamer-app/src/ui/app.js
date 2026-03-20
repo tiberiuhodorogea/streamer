@@ -1139,9 +1139,11 @@ class StreamerApp {
           logger.warn('[SFU] Audio producer transport closed');
           this.audioProducer = null;
         });
-      } else if (this.includeAudio && isGame && isWindowCapture && gamePid) {
-        // Kick off native game audio in the background so the video stream
-        // is NOT blocked by the 5-second WASAPI activation timeout.
+      } else if (this.includeAudio && isGame && gamePid) {
+        // Kick off native process-loopback audio in the background so the video
+        // stream is NOT blocked by the 5-second WASAPI activation timeout.
+        // This captures ONLY the game's audio (via WASAPI process-loopback),
+        // not system-wide desktop audio.
         this._startNativeGameAudioAsync(gamePid);
         this.updateAudioStatus('Starting...');
       } else {
@@ -1184,7 +1186,7 @@ class StreamerApp {
   async captureSourceStream(sourceId) {
     const profile = this.getActiveQualityProfile();
     const isWindowCapture = sourceId.startsWith('window:');
-    const allowAudioCapture = this.includeAudio && !(this._isGameCapture && isWindowCapture);
+    const allowAudioCapture = this.includeAudio && !this._isGameCapture;
     const mandatory = {
       chromeMediaSource: 'desktop',
       chromeMediaSourceId: sourceId,
@@ -1201,8 +1203,8 @@ class StreamerApp {
     const videoConstraints = { mandatory };
 
     if (!allowAudioCapture) {
-      if (this.includeAudio && this._isGameCapture && isWindowCapture) {
-        logger.info('[GAME] Window audio capture disabled to avoid leaking unrelated desktop audio into the game stream');
+      if (this.includeAudio && this._isGameCapture) {
+        logger.info('[GAME] Desktop audio capture disabled — native process-loopback will provide game-only audio');
       }
       return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
     }

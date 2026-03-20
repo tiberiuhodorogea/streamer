@@ -166,45 +166,35 @@ const logger = new DebugLogger();
 // QUALITY PROFILES
 // ============================================
 const QUALITY_PROFILES = {
-  smooth: {
-    label: 'Smooth FPS',
-    hint: '720p with headroom for high motion',
-    summary: '1280x720 cap, 60 fps target, 10 Mbps cap',
+  performance: {
+    label: 'Performance',
+    hint: 'Lower resolution, smooth framerate',
+    summary: '720p, 60 fps target, 8 Mbps cap',
     maxWidth: 1280,
     maxHeight: 720,
     maxFrameRate: 60,
-    maxBitrate: 10_000_000,
-    degradationPreference: 'maintain-framerate'
+    maxBitrate: 8_000_000,
+    degradationPreference: 'balanced'
   },
   balanced: {
     label: 'Balanced',
-    hint: 'Balanced for most sessions',
-    summary: '1920x1080 cap, 60 fps target, 16 Mbps cap',
+    hint: 'Best effort 1080p, targets 30+ fps',
+    summary: '1080p, 60 fps target, 16 Mbps cap',
     maxWidth: 1920,
     maxHeight: 1080,
     maxFrameRate: 60,
     maxBitrate: 16_000_000,
-    degradationPreference: 'maintain-framerate'
+    degradationPreference: 'balanced'
   },
   quality: {
-    label: 'High Quality',
-    hint: 'Sharper image for strong links',
-    summary: '2560x1440 cap, 60 fps target, 24 Mbps cap',
-    maxWidth: 2560,
-    maxHeight: 1440,
+    label: 'Quality',
+    hint: 'Push bitrate for sharp 1080p',
+    summary: '1080p, 60 fps target, 24 Mbps cap',
+    maxWidth: 1920,
+    maxHeight: 1080,
     maxFrameRate: 60,
     maxBitrate: 24_000_000,
     degradationPreference: 'balanced'
-  },
-  ultra: {
-    label: 'Ultra',
-    hint: 'Push quality hard on excellent links',
-    summary: 'Native capture cap, 60 fps target, 50 Mbps cap',
-    maxWidth: 3840,
-    maxHeight: 2160,
-    maxFrameRate: 60,
-    maxBitrate: 50_000_000,
-    degradationPreference: 'maintain-resolution'
   }
 };
 
@@ -231,12 +221,6 @@ class StreamerApp {
       this.streamerName = '';
       this.serverUrl = '';
       this.statsInterval = null;
-      this.adaptationLevels = [
-        { label: 'base', bitrateScale: 1, extraScale: 1 },
-        { label: 'step-1', bitrateScale: 0.75, extraScale: 1.3 },
-        { label: 'step-2', bitrateScale: 0.55, extraScale: 1.7 },
-        { label: 'step-3', bitrateScale: 0.4, extraScale: 2.2 }
-      ];
 
       logger.info('StreamerApp initializing...');
       this.attachEventListeners();
@@ -449,8 +433,12 @@ class StreamerApp {
           height: settings.height || 720,
           frameRate: settings.frameRate || 60
         };
-        logger.info('Capture: ' + settings.width + 'x' + settings.height + ' @ ' + Math.round(settings.frameRate || 60) + 'fps');
-        logger.info('Profile: ' + this.getActiveQualityProfile().label);
+        const prof = this.getActiveQualityProfile();
+        logger.info(
+          '[DIAG:CAPTURE] actual=' + settings.width + 'x' + settings.height + '@' + Math.round(settings.frameRate || 60) + 'fps' +
+          ' | profile=' + prof.label + ' maxRes=' + prof.maxWidth + 'x' + prof.maxHeight +
+          ' maxBitrate=' + (prof.maxBitrate / 1000000) + 'Mbps degradPref=' + prof.degradationPreference
+        );
       }
 
       const audioTracks = stream.getAudioTracks();
@@ -571,14 +559,15 @@ class StreamerApp {
         name: viewerName,
         status: 'connecting',
         connection: pc,
-        qualityLevel: 0,
-        goodReports: 0,
         lastReportAt: 0,
         iceRestarts: 0,
         videoSender: pc.getSenders().find((s) => s.track?.kind === 'video') || null
       });
       this.updateViewersList();
       this.ensureStatsCollection();
+
+      // When a new peer joins, reconfigure ALL existing peers with adjusted bitrate budgets
+      this.reconfigureAllSenders();
 
       this.createAndSendOffer(viewerId).catch((error) => {
         logger.error('Offer creation failed for ' + viewerName + ': ' + error.message);
@@ -633,17 +622,16 @@ class StreamerApp {
 
     try {
       const profile = this.getActiveQualityProfile();
-      const peer = Array.from(this.peers.values()).find((e) => e.videoSender === sender || e.name === viewerName);
-      const adaptation = this.adaptationLevels[peer?.qualityLevel || 0] || this.adaptationLevels[0];
       const sourceWidth = this.captureProfile?.width || 1280;
       const targetWidth = Math.min(sourceWidth, profile.maxWidth);
-      const baseScale = sourceWidth > targetWidth ? sourceWidth / targetWidth : 1;
-      const scaleResolutionDownBy = baseScale * adaptation.extraScale;
+      const scaleResolutionDownBy = sourceWidth > targetWidth ? sourceWidth / targetWidth : 1;
 
+      // Give each peer the full bitrate budget — Chrome's BWE will handle actual throughput.
+      // Dividing bitrate per peer just hurts quality without reducing encoder load.
       const parameters = sender.getParameters();
       parameters.degradationPreference = profile.degradationPreference;
       parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
-      parameters.encodings[0].maxBitrate = Math.round(profile.maxBitrate * adaptation.bitrateScale);
+      parameters.encodings[0].maxBitrate = profile.maxBitrate;
       parameters.encodings[0].maxFramerate = profile.maxFrameRate;
       parameters.encodings[0].priority = 'high';
       parameters.encodings[0].networkPriority = 'high';
@@ -656,10 +644,13 @@ class StreamerApp {
 
       await sender.setParameters(parameters);
 
+      const enc = parameters.encodings[0];
       logger.info(
-        'Sender tuned [' + viewerName + ']: ' + profile.label + '/' + adaptation.label +
-        ', ' + targetWidth + 'w max, ' + profile.maxFrameRate + 'fps, ' +
-        (parameters.encodings[0].maxBitrate / 1000000).toFixed(1) + ' Mbps cap'
+        '[DIAG:SENDER] ' + viewerName + ' | profile=' + profile.label +
+        ' peers=' + this.peers.size + ' | maxBitrate=' + (enc.maxBitrate / 1000000).toFixed(1) + 'Mbps' +
+        ' maxFps=' + enc.maxFramerate +
+        ' scaleDown=' + (enc.scaleResolutionDownBy || 1).toFixed(2) +
+        ' degradPref=' + (parameters.degradationPreference || 'none')
       );
     } catch (error) {
       logger.warn('Could not tune sender for ' + viewerName + ': ' + error.message);
@@ -669,38 +660,31 @@ class StreamerApp {
   async handleViewerQualityReport(data) {
     const { viewerId, fps, jitterMs } = data;
     const peer = this.peers.get(viewerId);
-    if (!peer || !peer.videoSender) return;
+    if (!peer) return;
 
+    // No custom adaptation — WebRTC's built-in BWE handles congestion.
+    // Just log for diagnostics.
     const now = Date.now();
     if (now - peer.lastReportAt < 900) return;
     peer.lastReportAt = now;
 
-    const profile = this.getActiveQualityProfile();
-    const targetFps = profile.maxFrameRate;
-    // Relative thresholds: downgrade if below 40% of target, upgrade if above 80%
-    const downgradeThreshold = targetFps * 0.4;
-    const upgradeThreshold = targetFps * 0.8;
-
-    if (fps != null && fps < downgradeThreshold && peer.qualityLevel < this.adaptationLevels.length - 1) {
-      peer.qualityLevel += 1;
-      peer.goodReports = 0;
-      logger.warn(peer.name + ' falling behind (' + fps + ' fps, ' + Math.round(jitterMs || 0) + 'ms jitter). Lowering quality.');
-      await this.configureVideoSender(peer.videoSender, peer.name);
-      return;
+    if (!this._qrLogCounter) this._qrLogCounter = 0;
+    this._qrLogCounter++;
+    if (this._qrLogCounter % 5 === 0) {
+      logger.debug('[DIAG:QR] ' + peer.name + ' | fps=' + fps + ' jitter=' + Math.round(jitterMs || 0) + 'ms');
     }
+  }
 
-    if (fps != null && fps > upgradeThreshold && (jitterMs || 0) < 80) {
-      peer.goodReports += 1;
-      if (peer.goodReports >= 5 && peer.qualityLevel > 0) {
-        peer.qualityLevel -= 1;
-        peer.goodReports = 0;
-        logger.info(peer.name + ' recovered (' + fps + ' fps). Raising quality.');
-        await this.configureVideoSender(peer.videoSender, peer.name);
+  reconfigureAllSenders() {
+    const peerCount = this.peers.size;
+    logger.info('Reconfiguring all senders for ' + peerCount + ' peer(s)');
+    for (const peer of this.peers.values()) {
+      if (peer.videoSender) {
+        this.configureVideoSender(peer.videoSender, peer.name).catch((err) => {
+          logger.warn('Reconfigure failed for ' + peer.name + ': ' + err.message);
+        });
       }
-      return;
     }
-
-    peer.goodReports = 0;
   }
 
   async applyLiveProfile() {
@@ -779,6 +763,9 @@ class StreamerApp {
     if (this.peers.size === 0) {
       this.stopStatsCollection();
       this.updateStatsDisplay(null, null);
+    } else {
+      // Remaining peers get more bitrate budget now
+      this.reconfigureAllSenders();
     }
   }
 
@@ -884,6 +871,21 @@ class StreamerApp {
     const avgFps = fpsSamples.length > 0
       ? fpsSamples.reduce((sum, v) => sum + v, 0) / fpsSamples.length
       : null;
+
+    // Log full outbound stats every 5 seconds
+    if (!this._diagStatsCounter) this._diagStatsCounter = 0;
+    this._diagStatsCounter++;
+    if (this._diagStatsCounter % 5 === 0) {
+      const peerSummaries = [];
+      for (const [vid, p] of this.peers.entries()) {
+        peerSummaries.push(p.name + ':L' + p.qualityLevel);
+      }
+      logger.info(
+        '[DIAG:OUTBOUND] bitrate=' + totalBitrateMbps.toFixed(2) + 'Mbps fps=' +
+        (avgFps != null ? Math.round(avgFps) : '--') +
+        ' peers=[' + peerSummaries.join(', ') + ']'
+      );
+    }
 
     this.updateStatsDisplay(totalBitrateMbps, avgFps);
   }

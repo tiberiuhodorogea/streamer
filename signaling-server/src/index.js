@@ -186,6 +186,15 @@ function handleViewerQualityReport(clientId, data) {
   const streamer = streamers.get(viewer.streamerId);
   if (!streamer) return;
 
+  // Log every quality report for diagnostics
+  console.log(
+    '[DIAG:QR] viewer=' + clientId +
+    ' fps=' + data.fps +
+    ' bitrate=' + data.bitrateMbps + 'Mbps' +
+    ' res=' + data.frameWidth + 'x' + data.frameHeight +
+    ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms'
+  );
+
   send(streamer.ws, 'viewer-quality-report', {
     viewerId: clientId,
     fps: data.fps,

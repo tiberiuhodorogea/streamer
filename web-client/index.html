@@ -53,10 +53,17 @@
               <span id="connectionQuality" class="quality"></span>
             </div>
           </div>
+          <div class="stats-overlay" id="statsOverlay" style="display: none;">
+            <div class="stats-overlay-row"><span id="overlayRes">--</span></div>
+            <div class="stats-overlay-row"><span id="overlayFps">-- fps</span></div>
+            <div class="stats-overlay-row"><span id="overlayBitrate">-- Mbps</span></div>
+            <div class="stats-overlay-row"><span id="overlayJitter">-- ms</span></div>
+          </div>
         </div>
         <div class="player-controls">
           <button id="playPauseBtn" class="btn btn-secondary btn-small">Pause</button>
           <button id="muteBtn" class="btn btn-secondary btn-small">Unmute</button>
+          <button id="statsToggleBtn" class="btn btn-secondary btn-small">Stats</button>
           <button id="fullscreenBtn" class="btn btn-primary btn-small">Fullscreen</button>
         </div>
         <div class="video-stats">
@@ -99,6 +106,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=viewer-ws-4"></script>
+  <script src="app.js?v=viewer-ws-6"></script>
 </body>
 </html>

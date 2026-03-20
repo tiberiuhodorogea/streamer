@@ -181,6 +181,7 @@ class ViewerApp {
     this.statsInterval = null;
     this.connectTimeout = null;
     this.audioMuted = true;
+    this.statsOverlayVisible = false;
     this.receiverSyncHintSeconds = 0.15;
     // Stats tracking
     this._prevBytesReceived = 0;
@@ -199,6 +200,7 @@ class ViewerApp {
     document.getElementById('playPauseBtn').addEventListener('click', () => this.togglePlayback());
     document.getElementById('muteBtn').addEventListener('click', () => this.toggleMute());
     document.getElementById('fullscreenBtn').addEventListener('click', () => this.toggleFullscreen());
+    document.getElementById('statsToggleBtn').addEventListener('click', () => this.toggleStatsOverlay());
     document.getElementById('remoteVideo').addEventListener('dblclick', () => this.toggleFullscreen());
     document.addEventListener('fullscreenchange', () => this.syncFullscreenButton());
     document.addEventListener('webkitfullscreenchange', () => this.syncFullscreenButton());
@@ -402,17 +404,32 @@ class ViewerApp {
     };
 
     this.peerConnection.onconnectionstatechange = () => {
+      if (!this.peerConnection) return;
       const state = this.peerConnection.connectionState;
-      debugConsole.info('Peer state: ' + state);
+      debugConsole.info('[DIAG:PEER] connectionState=' + state);
       document.getElementById('connectionQuality').textContent = state;
       if (state === 'failed' || state === 'disconnected' || state === 'closed') {
         this.handleStreamerDisconnected();
       }
     };
+
+    this.peerConnection.oniceconnectionstatechange = () => {
+      if (!this.peerConnection) return;
+      debugConsole.info('[DIAG:ICE] iceConnectionState=' + this.peerConnection.iceConnectionState);
+    };
+
+    this.peerConnection.onicegatheringstatechange = () => {
+      if (!this.peerConnection) return;
+      debugConsole.info('[DIAG:ICE] iceGatheringState=' + this.peerConnection.iceGatheringState);
+    };
   }
 
   async handleOffer(data) {
     const { offer } = data;
+    if (!this.peerConnection) {
+      debugConsole.warn('Ignoring offer — no active peer connection');
+      return;
+    }
     try {
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
       debugConsole.success('Remote description set');
@@ -457,6 +474,12 @@ class ViewerApp {
         const frameHeight = inboundVideo.frameHeight || 0;
         const framesDecoded = inboundVideo.framesDecoded || 0;
         const bytesReceived = inboundVideo.bytesReceived || 0;
+        const framesDropped = inboundVideo.framesDropped || 0;
+        const packetsLost = inboundVideo.packetsLost || 0;
+        const packetsReceived = inboundVideo.packetsReceived || 0;
+        const nackCount = inboundVideo.nackCount || 0;
+        const pliCount = inboundVideo.pliCount || 0;
+        const firCount = inboundVideo.firCount || 0;
 
         let fps = null;
         let bitrateMbps = null;
@@ -481,14 +504,36 @@ class ViewerApp {
           document.getElementById('resolution').textContent = frameWidth + 'x' + frameHeight;
         }
 
-        const jitterMs = inboundVideo.jitter ? Number((inboundVideo.jitter * 1000).toFixed(0)) : null;
+        const jitterMs = inboundVideo.jitter != null ? Number((inboundVideo.jitter * 1000).toFixed(0)) : null;
         document.getElementById('latency').textContent = (jitterMs != null ? jitterMs : '--') + ' ms';
+
+        // Update stats overlay
+        if (this.statsOverlayVisible) {
+          document.getElementById('overlayRes').textContent = (frameWidth && frameHeight) ? frameWidth + 'x' + frameHeight : '--';
+          document.getElementById('overlayFps').textContent = (fps != null ? fps + ' fps' : '-- fps');
+          document.getElementById('overlayBitrate').textContent = (bitrateMbps != null ? bitrateMbps + ' Mbps' : '-- Mbps');
+          document.getElementById('overlayJitter').textContent = (jitterMs != null ? jitterMs + ' ms' : '-- ms');
+        }
 
         if (fps !== null && this.socket && this.selectedStreamer) {
           this.socket.emit('viewer-quality-report', {
             streamerId: this.selectedStreamer,
             fps, bitrateMbps, frameWidth, frameHeight, jitterMs
           });
+
+          // Detailed diagnostic log every 5 seconds
+          if (!this._diagCounter) this._diagCounter = 0;
+          this._diagCounter++;
+          if (this._diagCounter % 5 === 0) {
+            debugConsole.info(
+              '[DIAG:INBOUND] ' + frameWidth + 'x' + frameHeight +
+              ' fps=' + fps + ' bitrate=' + bitrateMbps + 'Mbps' +
+              ' jitter=' + (jitterMs != null ? jitterMs : '--') + 'ms' +
+              ' dropped=' + framesDropped + ' lost=' + packetsLost +
+              '/' + packetsReceived + 'pkts' +
+              ' nack=' + nackCount + ' pli=' + pliCount + ' fir=' + firCount
+            );
+          }
         }
       } catch (error) {
         debugConsole.error('Stats error: ' + error.message);
@@ -589,6 +634,14 @@ class ViewerApp {
     const button = document.getElementById('fullscreenBtn');
     const inFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
     button.textContent = inFs ? 'Exit Fullscreen' : 'Fullscreen';
+  }
+
+  toggleStatsOverlay() {
+    this.statsOverlayVisible = !this.statsOverlayVisible;
+    const overlay = document.getElementById('statsOverlay');
+    const btn = document.getElementById('statsToggleBtn');
+    overlay.style.display = this.statsOverlayVisible ? 'block' : 'none';
+    btn.textContent = this.statsOverlayVisible ? 'Hide Stats' : 'Stats';
   }
 
   removeConnection() {

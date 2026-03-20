@@ -274,6 +274,35 @@ section h2 {
   min-width: 120px;
 }
 
+/* Stats Overlay */
+.stats-overlay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  pointer-events: none;
+  z-index: 10;
+  backdrop-filter: blur(4px);
+  min-width: 120px;
+}
+
+.stats-overlay-row {
+  white-space: nowrap;
+}
+
+.player-container:fullscreen .stats-overlay,
+.player-container:-webkit-full-screen .stats-overlay {
+  top: 16px;
+  right: 16px;
+  font-size: 15px;
+}
+
 .player-container:fullscreen {
   border-radius: 0;
   margin-bottom: 0;

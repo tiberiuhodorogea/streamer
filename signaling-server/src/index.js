@@ -4,10 +4,44 @@ import { WebSocketServer } from 'ws';
 import cors from 'cors';
 import mediasoup from 'mediasoup';
 import os from 'os';
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
 
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const repoRoot = path.resolve(__dirname, '..', '..');
+const sessionLogDir = path.join(repoRoot, 'logs', 'sessions');
+fs.mkdirSync(sessionLogDir, { recursive: true });
+
+const sessionStartedAt = new Date();
+const sessionId = sessionStartedAt.toISOString().replace(/[:.]/g, '-');
+let gitCommit = 'unknown';
+try {
+  gitCommit = execSync('git rev-parse --short HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
+} catch {}
+const sessionLogPath = path.join(sessionLogDir, `${sessionId}-${gitCommit}.jsonl`);
+const sessionMetaPath = path.join(sessionLogDir, `${sessionId}-${gitCommit}.meta.json`);
+fs.writeFileSync(sessionMetaPath, JSON.stringify({
+  sessionId,
+  gitCommit,
+  startedAt: sessionStartedAt.toISOString(),
+  server: 'signaling-server',
+  announcedIp: process.env.ANNOUNCED_IP || null,
+}, null, 2));
+
+function appendSessionLog(type, payload) {
+  fs.appendFileSync(sessionLogPath, JSON.stringify({
+    ts: new Date().toISOString(),
+    type,
+    payload,
+  }) + '\n');
+}
 
 // ============================================
 // CONFIGURATION
@@ -106,6 +140,7 @@ async function createWorker() {
   });
 
   console.log('[mediasoup] Worker created (pid: ' + worker.pid + ')');
+  appendSessionLog('worker-created', { pid: worker.pid });
   return worker;
 }
 
@@ -332,6 +367,15 @@ async function handleProduce(clientId, data) {
   }
 
   try {
+    // Close old producer of same kind first (if any) so consumers get
+    // 'producerclose' → viewer removes the dead track before the new one arrives.
+    const oldProducer = room.streamer.producers.get(data.kind);
+    if (oldProducer) {
+      console.log('[SFU] Closing previous ' + data.kind + ' producer ' + oldProducer.id);
+      oldProducer.close();
+      room.streamer.producers.delete(data.kind);
+    }
+
     const producer = await room.streamer.producerTransport.produce({
       kind: data.kind,
       rtpParameters: data.rtpParameters,
@@ -374,8 +418,26 @@ async function handleViewerJoin(clientId, data, ws) {
   console.log('[SFU] Viewer "' + viewerName + '" joining streamer ' + room.streamer.name);
 
   const client = clients.get(clientId);
+
+  // Clean up any previous viewer state before rejoining or switching rooms.
+  if (client.role === 'viewer' && client.roomId) {
+    const previousRoom = rooms.get(client.roomId);
+    const previousViewer = previousRoom?.viewers.get(clientId);
+    if (previousViewer) {
+      for (const [, consumer] of previousViewer.consumers) {
+        try { consumer.close(); } catch {}
+      }
+      if (previousViewer.consumerTransport) {
+        try { previousViewer.consumerTransport.close(); } catch {}
+      }
+      previousRoom.viewers.delete(clientId);
+      send(previousRoom.streamer.ws, 'viewer-left', { viewerId: clientId });
+    }
+  }
+
   client.role = 'viewer';
   client.roomId = streamerId;
+  client._zeroFpsCount = 0;
 
   room.viewers.set(clientId, {
     id: clientId,
@@ -452,6 +514,17 @@ async function handleConsume(clientId, data) {
     const consumerDataList = [];
 
     for (const [kind, producer] of room.streamer.producers) {
+      let existingConsumer = null;
+      for (const [, consumer] of viewer.consumers) {
+        if (consumer.producerId === producer.id) {
+          existingConsumer = consumer;
+          break;
+        }
+      }
+      if (existingConsumer) {
+        continue;
+      }
+
       if (!room.router.canConsume({ producerId: producer.id, rtpCapabilities: data.rtpCapabilities })) {
         console.log('[SFU] Cannot consume ' + kind + ' for viewer ' + viewer.name);
         continue;
@@ -530,6 +603,17 @@ function handleViewerQualityReport(clientId, data) {
     ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms' +
     ' loss=' + (data.lossRate != null ? (data.lossRate * 100).toFixed(1) + '%' : '--')
   );
+
+  appendSessionLog('viewer-quality-report', {
+    clientId,
+    streamerId: room.streamer?.id || null,
+    fps: data.fps,
+    bitrateMbps: data.bitrateMbps,
+    frameWidth: data.frameWidth,
+    frameHeight: data.frameHeight,
+    jitterMs: data.jitterMs,
+    lossRate: data.lossRate,
+  });
 
   send(room.streamer.ws, 'viewer-quality-report', {
     viewerId: clientId,

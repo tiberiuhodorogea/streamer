@@ -238,6 +238,21 @@ const DEGRADATION_TIERS = [
 ];
 
 // ============================================
+// GAME-OPTIMISED DEGRADATION TIERS
+// Games look terrible with FPS drops but tolerate resolution scaling well.
+// Strategy: NEVER reduce FPS. Only cut bitrate and scale resolution.
+// More granular steps for smoother transitions during action scenes.
+// ============================================
+const GAME_DEGRADATION_TIERS = [
+  { bitratePct: 1.00, scaleDown: 1.0, fpsFraction: 1.0, label: 'ULTRA' },   // full quality, full fps
+  { bitratePct: 0.80, scaleDown: 1.0, fpsFraction: 1.0, label: 'HIGH'  },   // light bitrate cut — encoder absorbs via QP
+  { bitratePct: 0.65, scaleDown: 1.0, fpsFraction: 1.0, label: 'MED+'  },   // moderate bitrate cut, still native res
+  { bitratePct: 0.50, scaleDown: 1.25, fpsFraction: 1.0, label: 'MED'  },   // mild downscale (1536x864 from 1080p)
+  { bitratePct: 0.40, scaleDown: 1.5, fpsFraction: 1.0, label: 'LOW+'  },   // 1280x720 equivalent — still 60fps
+  { bitratePct: 0.30, scaleDown: 2.0, fpsFraction: 1.0, label: 'LOW'   },   // 960x540 at 60fps — last resort
+];
+
+// ============================================
 // ADAPTIVE QUALITY CONTROLLER
 // Navigates tiers based on viewer health signals.
 // Degrades fast (2s cooldown), recovers aggressively (3s of good health).
@@ -246,6 +261,7 @@ class AdaptiveQualityController {
   constructor(streamerApp) {
     this.app = streamerApp;
     this.enabled = true;
+    this.gameMode = false;            // set by streamer when game capture starts
     this.tierIndex = 0;               // current tier (0 = max quality)
     this.profileMaxBitrate = 0;
     this.profileMaxFps = 60;
@@ -269,7 +285,15 @@ class AdaptiveQualityController {
     this.lossCriticalRate = 0.10;     // >10% packet loss = critical
   }
 
-  get currentTier() { return DEGRADATION_TIERS[this.tierIndex]; }
+  get _degradeCooldownMs() { return this.gameMode ? 1200 : this.degradeCooldownMs; }
+
+  get _recoverCooldownMs() { return this.gameMode ? 1200 : this.recoverCooldownMs; }
+
+  get _recoverWaitMs() { return this.gameMode ? 1500 : this.recoverWaitMs; }
+
+  get _tiers() { return this.gameMode ? GAME_DEGRADATION_TIERS : DEGRADATION_TIERS; }
+
+  get currentTier() { return this._tiers[this.tierIndex]; }
 
   get effectiveBitrate() {
     return Math.max(this.floor, Math.round(this.profileMaxBitrate * this.currentTier.bitratePct));
@@ -359,26 +383,26 @@ class AdaptiveQualityController {
         logger.warn('[ABR] Source stall detected (all viewers 0fps/0bps) — holding tier ' + this.currentTier.label);
       }
     } else if (assessment === 'critical') {
-      if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
+      if (now - this.lastDegradeTime >= this._degradeCooldownMs) {
         this._stepDown(2); // emergency: skip 2 tiers
       }
     } else if (assessment === 'warning') {
-      if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
+      if (now - this.lastDegradeTime >= this._degradeCooldownMs) {
         this._stepDown(1);
       }
     } else if (assessment === 'good') {
       if (this.tierIndex > 0) {
         if (!this.goodHealthStart) {
           this.goodHealthStart = now;
-        } else if (now - this.goodHealthStart >= this.recoverWaitMs &&
-                   now - this.lastRecoverTime >= this.recoverCooldownMs) {
+        } else if (now - this.goodHealthStart >= this._recoverWaitMs &&
+                   now - this.lastRecoverTime >= this._recoverCooldownMs) {
           // Gate: only step up if actual bitrate can support the next tier
-          const nextTier = DEGRADATION_TIERS[this.tierIndex - 1];
+          const nextTier = this._tiers[this.tierIndex - 1];
           const neededMbps = (this.profileMaxBitrate * nextTier.bitratePct) / 1e6;
           const currentMbps = this._getMinViewerBitrate();
-          if (currentMbps >= neededMbps * 0.5) {
-            // Viewers are delivering at least 50% of next tier's bitrate — safe to step up
-            this._stepUp(1);
+          if (currentMbps >= neededMbps * (this.gameMode ? 0.45 : 0.5)) {
+            const veryGood = this._isVeryGoodHealth();
+            this._stepUp(veryGood ? 2 : 1);
           } else {
             // Not enough bandwidth headroom — hold position, don't reset goodHealthStart
             if (this._evalCounter % 3 === 0) {
@@ -410,9 +434,12 @@ class AdaptiveQualityController {
       const baseline = health.baselineSamples >= 3 ? health.baselineFps : recentAvg;
       const avgJitter = health.jitterSamples.slice(-3).reduce((a, b) => a + b, 0) / Math.min(health.jitterSamples.length, 3);
 
+      const crashThreshold = this.gameMode ? 0.55 : 0.3;
+      const warnThreshold = this.gameMode ? 0.85 : 0.6;
+
       if (recent.some(f => f === 0)) hasZeroFps = true;
-      if (baseline > 5 && recentAvg < baseline * 0.3) hasFpsCrash = true;
-      if (baseline > 5 && recentAvg < baseline * 0.6) hasFpsDrop = true;
+      if (baseline > 5 && recentAvg < baseline * crashThreshold) hasFpsCrash = true;
+      if (baseline > 5 && recentAvg < baseline * warnThreshold) hasFpsDrop = true;
 
       worstJitter = Math.max(worstJitter, avgJitter);
       worstLoss = Math.max(worstLoss, health.lossRate);
@@ -428,16 +455,37 @@ class AdaptiveQualityController {
     }
 
     // Critical: zero fps OR fps crash OR extreme jitter OR extreme loss
-    if (hasZeroFps || hasFpsCrash || worstJitter > this.jitterCriticalMs || worstLoss > this.lossCriticalRate) {
+    const jitterCritical = this.gameMode ? 35 : this.jitterCriticalMs;
+    const jitterWarn = this.gameMode ? 18 : this.jitterWarnMs;
+
+    if (hasZeroFps || hasFpsCrash || worstJitter > jitterCritical || worstLoss > this.lossCriticalRate) {
       return 'critical';
     }
     // Warning: fps drop OR high jitter OR notable loss  
     // Loss alone only triggers warning if combined with elevated jitter (>20ms)
-    if (hasFpsDrop || worstJitter > this.jitterWarnMs ||
+    if (hasFpsDrop || worstJitter > jitterWarn ||
         (worstLoss > this.lossWarnRate && worstJitter > 20)) {
       return 'warning';
     }
     return 'good';
+  }
+
+  _isVeryGoodHealth() {
+    if (this.viewerHealth.size === 0) return false;
+
+    for (const [, health] of this.viewerHealth) {
+      if (health.fpsSamples.length < 3) return false;
+      const recent = health.fpsSamples.slice(-3);
+      const recentAvg = recent.reduce((a, b) => a + b, 0) / recent.length;
+      const baseline = health.baselineSamples >= 3 ? health.baselineFps : recentAvg;
+      const jRecent = health.jitterSamples.slice(-3);
+      const jAvg = jRecent.reduce((a, b) => a + b, 0) / jRecent.length;
+      if (baseline > 5 && recentAvg < baseline * 0.95) return false;
+      if (jAvg > (this.gameMode ? 10 : 8)) return false;
+      if (health.lossRate > 0.01) return false;
+    }
+
+    return true;
   }
 
   _getMinViewerBitrate() {
@@ -450,7 +498,7 @@ class AdaptiveQualityController {
 
   _stepDown(steps) {
     const prevTier = this.tierIndex;
-    this.tierIndex = Math.min(DEGRADATION_TIERS.length - 1, this.tierIndex + steps);
+    this.tierIndex = Math.min(this._tiers.length - 1, this.tierIndex + steps);
     if (this.tierIndex !== prevTier) {
       // Reset baselines since FPS target changed — prevents cross-tier confusion
       for (const [, health] of this.viewerHealth) {
@@ -535,7 +583,21 @@ class StreamerApp {
       this._prevBytesSent = 0;
       this._prevFramesEncoded = 0;
       this._prevStatsTimestamp = 0;
+      this._nativeVideoTrack = null;
+      this._nativeVideoWriter = null;
+      this._nativeFrameWritePending = false;
+      this._nativeGameHwnd = null;
+      this._nativeGamePid = null;
+      this._nativeFrameTimestampUs = 0;
+      this._nativeGameAudioTrack = null;
+      this._nativeGameAudioContext = null;
+      this._nativeGameAudioNode = null;
+      this._nativeGameAudioDestination = null;
+      this._nativeGameAudioQueue = [];
+      this._enableExperimentalWgc = false;
+      this._useCustomGameAbr = true;
       this.abr = new AdaptiveQualityController(this);
+      this._bitrateCapMbps = null; // null = use profile default
 
       logger.info('StreamerApp initializing (SFU mode)...');
       this.attachEventListeners();
@@ -553,6 +615,8 @@ class StreamerApp {
     const clearLogsBtn = document.getElementById('toggleDebug');
     const qualityProfile = document.getElementById('qualityProfile');
     const includeAudio = document.getElementById('includeAudio');
+    const enableExperimentalWgc = document.getElementById('enableExperimentalWgc');
+    const useCustomGameAbr = document.getElementById('useCustomGameAbr');
 
     if (connectBtn) connectBtn.addEventListener('click', () => this.connect());
     if (refreshBtn) refreshBtn.addEventListener('click', () => this.loadCaptureSources());
@@ -565,6 +629,23 @@ class StreamerApp {
       this.refreshQualityProfileUi();
     }
 
+    const bitrateSlider = document.getElementById('bitrateSlider');
+    const bitrateValue = document.getElementById('bitrateValue');
+    if (bitrateSlider) {
+      // Init from profile default
+      const defaultMbps = Math.round(this.getActiveQualityProfile().maxBitrate / 1_000_000);
+      bitrateSlider.value = defaultMbps;
+      if (bitrateValue) bitrateValue.textContent = defaultMbps + ' Mbps';
+
+      bitrateSlider.addEventListener('input', () => {
+        const mbps = parseInt(bitrateSlider.value, 10);
+        if (bitrateValue) bitrateValue.textContent = mbps + ' Mbps';
+        this._bitrateCapMbps = mbps;
+        this._updateProfileSummary();
+        logger.info('Bitrate cap set to ' + mbps + ' Mbps');
+      });
+    }
+
     if (includeAudio) {
       includeAudio.checked = this.includeAudio;
       includeAudio.addEventListener('change', () => {
@@ -572,10 +653,49 @@ class StreamerApp {
         logger.info('Source audio ' + (this.includeAudio ? 'enabled' : 'disabled'));
       });
     }
+
+    if (enableExperimentalWgc) {
+      enableExperimentalWgc.checked = this._enableExperimentalWgc;
+      enableExperimentalWgc.addEventListener('change', () => {
+        this._enableExperimentalWgc = enableExperimentalWgc.checked;
+        logger.info('[WGC] Experimental native capture ' + (this._enableExperimentalWgc ? 'enabled' : 'disabled'));
+      });
+    }
+
+    if (useCustomGameAbr) {
+      useCustomGameAbr.checked = this._useCustomGameAbr;
+      useCustomGameAbr.addEventListener('change', () => {
+        this._useCustomGameAbr = useCustomGameAbr.checked;
+        this._syncAbrMode();
+        logger.info('[ABR] Custom game ABR ' + (this._useCustomGameAbr ? 'enabled' : 'disabled'));
+      });
+    }
+  }
+
+  _syncAbrMode() {
+    this.abr.gameMode = this._isGameCapture && this._useCustomGameAbr;
+    if (this.isBroadcasting) {
+      const profile = this.getActiveQualityProfile();
+      this.abr.setProfile(profile.maxBitrate, profile.maxFrameRate);
+      logger.info('[ABR] Mode=' + (this.abr.gameMode ? 'game-optimised' : 'default') + ' for current stream');
+    }
   }
 
   getActiveQualityProfile() {
-    return QUALITY_PROFILES[this.selectedProfileKey] || QUALITY_PROFILES.quality;
+    const base = QUALITY_PROFILES[this.selectedProfileKey] || QUALITY_PROFILES.quality;
+    if (this._bitrateCapMbps) {
+      return Object.assign({}, base, {
+        maxBitrate: this._bitrateCapMbps * 1_000_000,
+        summary: base.maxWidth + 'x' + base.maxHeight + ' / ' + base.maxFrameRate + ' fps / ' + this._bitrateCapMbps + ' Mbps cap',
+      });
+    }
+    return base;
+  }
+
+  _updateProfileSummary() {
+    const profile = this.getActiveQualityProfile();
+    const summary = document.getElementById('profileSummary');
+    if (summary) summary.textContent = profile.summary;
   }
 
   setQualityProfile(profileKey) {
@@ -584,11 +704,23 @@ class StreamerApp {
       return;
     }
     this.selectedProfileKey = profileKey;
+
+    // Sync slider to new profile default if user hasn't manually set it yet
+    const slider = document.getElementById('bitrateSlider');
+    const valEl = document.getElementById('bitrateValue');
+    if (!this._bitrateCapMbps && slider) {
+      const defaultMbps = Math.round(QUALITY_PROFILES[profileKey].maxBitrate / 1_000_000);
+      slider.value = defaultMbps;
+      if (valEl) valEl.textContent = defaultMbps + ' Mbps';
+    }
+
     this.refreshQualityProfileUi();
+    this._updateProfileSummary();
     logger.info('Quality profile set to ' + QUALITY_PROFILES[profileKey].label);
 
     // Update ABR — resets to max quality tier for the new profile
-    this.abr.setProfile(QUALITY_PROFILES[profileKey].maxBitrate, QUALITY_PROFILES[profileKey].maxFrameRate);
+    const prof = this.getActiveQualityProfile();
+    this.abr.setProfile(prof.maxBitrate, prof.maxFrameRate);
   }
 
   async updateProducerEncoding() {
@@ -821,7 +953,7 @@ class StreamerApp {
           '<button class="btn btn-small">Stream This</button>';
         sourceEl.querySelector('button').addEventListener('click', () => {
           logger.info('Selected: ' + source.name + (source.isGame ? ' [GAME]' : ''));
-          this.startStreaming(source.id, source.name, source.isGame);
+          this.startStreaming(source.id, source.name, source.isGame, source.gameHwnd, source.gamePid);
         });
         grid.appendChild(sourceEl);
       });
@@ -830,29 +962,22 @@ class StreamerApp {
     }
   }
 
-  async startStreaming(sourceId, sourceName, isGame = false) {
+  async startStreaming(sourceId, sourceName, isGame = false, gameHwnd = null, gamePid = null) {
     try {
       logger.info('Starting stream: ' + sourceName + (isGame ? ' [GAME MODE]' : ''));
 
       this._isGameCapture = isGame;
+      this._nativeGameHwnd = gameHwnd;
+      this._nativeGamePid = gamePid;
+      this.abr.gameMode = isGame && this._useCustomGameAbr;
       const isWindowCapture = sourceId.startsWith('window:');
 
-      // ── GAME CAPTURE STRATEGY ──────────────────────────────
-      // For game windows: auto-switch to screen capture.
-      // Chromium window capture fails for most DirectX/Vulkan games,
-      // but screen capture (DXGI Desktop Duplication) works reliably.
       if (isGame && isWindowCapture) {
-        logger.info('[GAME] Window capture unreliable for games — auto-switching to screen capture');
-        const screenId = await this._findScreenSource();
-        if (screenId) {
-          sourceId = screenId;
-          logger.info('[GAME] Using screen source: ' + screenId);
-        } else {
-          logger.warn('[GAME] No screen source found — attempting window capture anyway');
-        }
+        logger.info('[GAME] Trying direct window capture first (preferred: no cursor, no desktop bleed)');
       }
 
       this._lastSourceId = sourceId;
+      this._gameUsedScreenFallback = false;
 
       if (sourceId.startsWith('window:') && window.electron?.prepareForCapture) {
         logger.info('Minimizing streamer window before window capture');
@@ -912,6 +1037,20 @@ class StreamerApp {
           }
         }
 
+        // NOTE: Do NOT upgrade to native WGC capture here. Chromium's built-in
+        // WGC (enabled via --enable-features=WebRtcAllowWgcWindowCapturer) handles
+        // DirectX/Vulkan game capture internally with zero-copy GPU paths, which
+        // is far more efficient than the native addon's raw-pixel IPC pipeline.
+        // The native WGC path is kept for future use but disabled by default.
+
+        // For game window captures, schedule an early frame-production check.
+        // If the window capture isn't producing frames (e.g. exclusive fullscreen
+        // which WGC/GDI can't capture), automatically fall back to screen capture
+        // while keeping process-isolated audio.
+        if (isGame && isWindowCapture && this.videoProducer) {
+          this._scheduleGameCaptureFallbackCheck();
+        }
+
         this.videoProducer.on('transportclose', () => {
           logger.warn('[SFU] Video producer transport closed');
           this.videoProducer = null;
@@ -919,10 +1058,18 @@ class StreamerApp {
       }
 
       // Produce audio
+      let producedAudioTrack = null;
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length > 0) {
+        producedAudioTrack = audioTracks[0];
+      }
+
+      if (producedAudioTrack) {
+        if (!stream.getAudioTracks().includes(producedAudioTrack)) {
+          stream.addTrack(producedAudioTrack);
+        }
         this.audioProducer = await this.sendTransport.produce({
-          track: audioTracks[0],
+          track: producedAudioTrack,
         });
         logger.info('[SFU] Audio producer created (id: ' + this.audioProducer.id + ')');
         this.updateAudioStatus('Live');
@@ -931,6 +1078,11 @@ class StreamerApp {
           logger.warn('[SFU] Audio producer transport closed');
           this.audioProducer = null;
         });
+      } else if (this.includeAudio && isGame && isWindowCapture && gamePid) {
+        // Kick off native game audio in the background so the video stream
+        // is NOT blocked by the 5-second WASAPI activation timeout.
+        this._startNativeGameAudioAsync(gamePid);
+        this.updateAudioStatus('Starting...');
       } else {
         logger.warn('Audio capture unavailable for this source');
         this.updateAudioStatus(this.includeAudio ? 'Unavailable' : 'Off');
@@ -962,6 +1114,8 @@ class StreamerApp {
 
   async captureSourceStream(sourceId) {
     const profile = this.getActiveQualityProfile();
+    const isWindowCapture = sourceId.startsWith('window:');
+    const allowAudioCapture = this.includeAudio && !(this._isGameCapture && isWindowCapture);
     const mandatory = {
       chromeMediaSource: 'desktop',
       chromeMediaSourceId: sourceId,
@@ -970,15 +1124,18 @@ class StreamerApp {
       maxFrameRate: profile.maxFrameRate
     };
 
-    // For game captures, suppress the OS mouse cursor from the stream.
-    // Chromium desktop capture only respects cursor inside the mandatory block.
-    if (this._isGameCapture) {
-      mandatory.cursor = 'never';
-    }
+    // NOTE: Do NOT add cursor constraints to the mandatory block here.
+    // Unknown mandatory properties (like cursor: 'never') can cause Chromium
+    // to fall back from WGC to GDI-based capture, which cannot capture
+    // DirectX/Vulkan game surfaces. Cursor suppression is handled by the
+    // native WGC capture path (IsCursorCaptureEnabled = false).
 
     const videoConstraints = { mandatory };
 
-    if (!this.includeAudio) {
+    if (!allowAudioCapture) {
+      if (this.includeAudio && this._isGameCapture && isWindowCapture) {
+        logger.info('[GAME] Window audio capture disabled to avoid leaking unrelated desktop audio into the game stream');
+      }
       return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
     }
 
@@ -1120,12 +1277,9 @@ class StreamerApp {
     if (!this.videoProducer || !this.videoProducer.rtpSender) return;
 
     try {
-      // Determine source — game captures use screen, otherwise original sourceId
-      let sourceId = this._lastSourceId;
-      if (this._isGameCapture) {
-        const screenId = await this._findScreenSource();
-        if (screenId) sourceId = screenId;
-      }
+      // Re-acquire the same original source. For games this keeps us on the
+      // actual game window instead of silently drifting into full-screen capture.
+      const sourceId = this._lastSourceId;
       if (!sourceId) return;
 
       const newStream = await this.captureSourceStream(sourceId);
@@ -1147,15 +1301,103 @@ class StreamerApp {
     }
   }
 
+  /**
+   * After starting a game window capture, checks if frames are actually being
+   * encoded. If the encoder hasn't produced any frames after 2 seconds, the
+   * game window is likely in exclusive fullscreen (not capturable by WGC / GDI).
+   * In that case, silently switch to screen capture (DXGI Desktop Duplication)
+   * while keeping process-isolated audio.
+   */
+  _scheduleGameCaptureFallbackCheck() {
+    if (this._gameFallbackTimer) clearTimeout(this._gameFallbackTimer);
+    this._gameFallbackTimer = setTimeout(async () => {
+      this._gameFallbackTimer = null;
+      if (!this.videoProducer || !this.isBroadcasting) return;
+
+      try {
+        const stats = await this.videoProducer.getStats();
+        let framesEncoded = 0;
+        stats.forEach(r => {
+          if (r.type === 'outbound-rtp' && r.kind === 'video') {
+            framesEncoded = r.framesEncoded || 0;
+          }
+        });
+
+        if (framesEncoded < 5) {
+          logger.warn('[GAME] Only ' + framesEncoded + ' frames encoded in 2s — window capture failing (exclusive fullscreen?)');
+          await this._fallbackToScreenCapture();
+        } else {
+          logger.info('[GAME] Window capture producing frames normally (' + framesEncoded + ' in 2s)');
+        }
+      } catch (e) {
+        logger.warn('[GAME] Fallback check failed: ' + e.message);
+      }
+    }, 2000);
+  }
+
+  /**
+   * Switches from a failing window capture to screen capture (DXGI Desktop
+   * Duplication). Used when a game is in exclusive fullscreen and window capture
+   * can't see the DirectX surface. Audio stays on process-loopback.
+   */
+  async _fallbackToScreenCapture() {
+    if (!this.videoProducer?.rtpSender) return;
+
+    const screenId = await this._findScreenSource();
+    if (!screenId) {
+      logger.error('[GAME] No screen source found for fallback');
+      return;
+    }
+
+    try {
+      // Tear down native WGC (it failed anyway)
+      this._teardownNativeWgc();
+
+      // Get screen capture stream (video only — audio via process loopback)
+      const savedGameFlag = this._isGameCapture;
+      this._isGameCapture = false; // temporarily clear so captureSourceStream doesn't block audio
+      const screenStream = await this.captureSourceStream(screenId);
+      this._isGameCapture = savedGameFlag;
+
+      const newTrack = screenStream.getVideoTracks()[0];
+      if (!newTrack) {
+        logger.error('[GAME] Screen capture returned no video track');
+        return;
+      }
+
+      newTrack.contentHint = 'motion';
+      await this.videoProducer.rtpSender.replaceTrack(newTrack);
+
+      // Stop old window capture tracks
+      if (this.localStream) {
+        this.localStream.getVideoTracks().forEach(t => t.stop());
+      }
+      this.localStream = screenStream;
+      this._lastSourceId = screenId;
+      this._gameUsedScreenFallback = true;
+
+      logger.info('[GAME] Switched to screen capture (DXGI) — game in exclusive fullscreen. Audio stays on process loopback.');
+    } catch (e) {
+      logger.error('[GAME] Screen capture fallback failed: ' + e.message);
+    }
+  }
+
   stopStreaming() {
     logger.info('Stopping stream...');
 
-    // Stop health check and native game capture
+    // Stop health check, fallback timer, and native game capture
     this._stopSourceHealthCheck();
+    if (this._gameFallbackTimer) { clearTimeout(this._gameFallbackTimer); this._gameFallbackTimer = null; }
+    this._teardownNativeWgc();
+    this._teardownNativeGameAudio();
     if (this._isGameCapture && window.electron?.stopNativeCapture) {
       window.electron.stopNativeCapture().catch(() => {});
     }
     this._isGameCapture = false;
+    this._nativeGameHwnd = null;
+    this._nativeGamePid = null;
+    this.abr.gameMode = false;
+    this.abr.tierIndex = 0;
 
     if (this.videoProducer) {
       this.videoProducer.close();
@@ -1188,6 +1430,248 @@ class StreamerApp {
 
     this.hideStreamPanel();
     this.showCapturePanel();
+  }
+
+  /**
+   * Fire-and-forget wrapper: starts native game audio in the background
+   * and attaches the audio producer once it's ready, so the video stream
+   * isn't blocked by the WASAPI activation wait.
+   */
+  async _startNativeGameAudioAsync(gamePid) {
+    try {
+      logger.info('[GAME-AUDIO] Starting native game audio pipeline for pid=' + gamePid);
+      const audioTrack = await this._startNativeGameAudio(gamePid);
+      if (!audioTrack) {
+        logger.warn('[GAME-AUDIO] _startNativeGameAudio returned null — no track produced');
+        this.updateAudioStatus(this.includeAudio ? 'Unavailable' : 'Off');
+        return;
+      }
+      logger.info('[GAME-AUDIO] Got audio track: id=' + audioTrack.id + ' enabled=' + audioTrack.enabled + ' readyState=' + audioTrack.readyState);
+      if (!this.isBroadcasting || !this.sendTransport) {
+        logger.warn('[GAME-AUDIO] Stream stopped before audio was ready');
+        return;
+      }
+      logger.info('[GAME-AUDIO] Producing audio track via SFU transport...');
+      this.audioProducer = await this.sendTransport.produce({ track: audioTrack });
+      logger.info('[SFU] Audio producer created (id: ' + this.audioProducer.id + ')');
+      this.updateAudioStatus('Live');
+      this.audioProducer.on('transportclose', () => {
+        logger.warn('[SFU] Audio producer transport closed');
+        this.audioProducer = null;
+      });
+    } catch (err) {
+      logger.warn('[GAME-AUDIO] Background audio start failed: ' + err.message + ' stack: ' + (err.stack || 'n/a'));
+      this.updateAudioStatus('Unavailable');
+    }
+  }
+
+  async _startNativeGameAudio(gamePid) {
+    logger.info('[GAME-AUDIO] _startNativeGameAudio: checking API availability...');
+    if (!window.electron?.isNativeProcessAudioAvailable || !window.electron?.startNativeProcessAudio) {
+      logger.warn('[GAME-AUDIO] Native game audio capture API unavailable (isAvailFn=' + !!window.electron?.isNativeProcessAudioAvailable + ' startFn=' + !!window.electron?.startNativeProcessAudio + ')');
+      return null;
+    }
+
+    const available = await window.electron.isNativeProcessAudioAvailable();
+    logger.info('[GAME-AUDIO] isNativeProcessAudioAvailable=' + available);
+    if (!available) {
+      logger.warn('[GAME-AUDIO] Native process-loopback audio not supported on this system');
+      return null;
+    }
+
+    this._teardownNativeGameAudio();
+    logger.info('[GAME-AUDIO] Previous audio state torn down, calling startNativeProcessAudio({pid: ' + gamePid + '})...');
+
+    const startResult = await window.electron.startNativeProcessAudio({ pid: gamePid });
+    logger.info('[GAME-AUDIO] startNativeProcessAudio result: ' + JSON.stringify(startResult));
+    if (!startResult?.success) {
+      logger.warn('[GAME-AUDIO] Native game audio start failed: ' + (startResult?.reason || 'unknown'));
+      return null;
+    }
+
+    const format = startResult.format || {};
+    const sampleRate = format.sampleRate || 48000;
+    const channels = format.channels || 2;
+    logger.info('[GAME-AUDIO] Format: sampleRate=' + sampleRate + ' channels=' + channels);
+
+    this._nativeGameAudioQueue = [];
+    this._nativeGameAudioContext = new AudioContext({ sampleRate, latencyHint: 'interactive' });
+    this._nativeGameAudioNode = this._nativeGameAudioContext.createScriptProcessor(2048, 0, channels);
+    this._nativeGameAudioDestination = this._nativeGameAudioContext.createMediaStreamDestination();
+
+    this._nativeGameAudioNode.onaudioprocess = (event) => {
+      const frameCount = event.outputBuffer.length;
+      const outputChannels = [];
+      for (let channelIndex = 0; channelIndex < channels; channelIndex++) {
+        const channelData = event.outputBuffer.getChannelData(channelIndex);
+        channelData.fill(0);
+        outputChannels.push(channelData);
+      }
+
+      let outputOffset = 0;
+      while (outputOffset < frameCount && this._nativeGameAudioQueue.length > 0) {
+        const chunk = this._nativeGameAudioQueue[0];
+        const availableFrames = chunk.frameCount - chunk.offsetFrames;
+        const framesToCopy = Math.min(frameCount - outputOffset, availableFrames);
+
+        for (let frameIndex = 0; frameIndex < framesToCopy; frameIndex++) {
+          const srcFrame = chunk.offsetFrames + frameIndex;
+          for (let channelIndex = 0; channelIndex < channels; channelIndex++) {
+            outputChannels[channelIndex][outputOffset + frameIndex] = chunk.samples[(srcFrame * channels) + channelIndex] || 0;
+          }
+        }
+
+        chunk.offsetFrames += framesToCopy;
+        outputOffset += framesToCopy;
+        if (chunk.offsetFrames >= chunk.frameCount) {
+          this._nativeGameAudioQueue.shift();
+        }
+      }
+    };
+
+    this._nativeGameAudioNode.connect(this._nativeGameAudioDestination);
+    await this._nativeGameAudioContext.resume();
+    logger.info('[GAME-AUDIO] AudioContext state=' + this._nativeGameAudioContext.state + ' sampleRate=' + this._nativeGameAudioContext.sampleRate);
+
+    let chunkCount = 0;
+    window.electron.onGameAudioChunk((buffer, meta) => {
+      const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+      const samples = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      chunkCount++;
+      if (chunkCount === 1) {
+        logger.info('[GAME-AUDIO] First chunk received in renderer: frames=' + meta.frameCount + ' bytes=' + bytes.byteLength + ' samplesLen=' + samples.length);
+      } else if (chunkCount % 500 === 0) {
+        logger.info('[GAME-AUDIO] Chunk #' + chunkCount + ', queueLen=' + this._nativeGameAudioQueue.length);
+      }
+      this._nativeGameAudioQueue.push({
+        samples,
+        frameCount: meta.frameCount,
+        offsetFrames: 0,
+      });
+
+      if (this._nativeGameAudioQueue.length > 64) {
+        this._nativeGameAudioQueue.splice(0, this._nativeGameAudioQueue.length - 64);
+      }
+    });
+
+    this._nativeGameAudioTrack = this._nativeGameAudioDestination.stream.getAudioTracks()[0] || null;
+    if (this._nativeGameAudioTrack) {
+      this._nativeGameAudioTrack.contentHint = 'music';
+      logger.info('[GAME-AUDIO] Native game-only audio attached from process ' + gamePid);
+    }
+
+    return this._nativeGameAudioTrack;
+  }
+
+  _teardownNativeGameAudio() {
+    if (window.electron?.removeGameAudioChunkListener) {
+      window.electron.removeGameAudioChunkListener();
+    }
+    if (window.electron?.stopNativeProcessAudio) {
+      window.electron.stopNativeProcessAudio().catch(() => {});
+    }
+    if (this._nativeGameAudioNode) {
+      try { this._nativeGameAudioNode.disconnect(); } catch (_) {}
+      this._nativeGameAudioNode.onaudioprocess = null;
+      this._nativeGameAudioNode = null;
+    }
+    if (this._nativeGameAudioTrack) {
+      try { this._nativeGameAudioTrack.stop(); } catch (_) {}
+      this._nativeGameAudioTrack = null;
+    }
+    if (this._nativeGameAudioContext) {
+      this._nativeGameAudioContext.close().catch(() => {});
+      this._nativeGameAudioContext = null;
+    }
+    this._nativeGameAudioDestination = null;
+    this._nativeGameAudioQueue = [];
+  }
+
+  async _upgradeProducerToNativeWgc(gameHwnd, fallbackTrack, fallbackStream) {
+    const NativeGenerator = window.MediaStreamTrackGenerator || window.VideoTrackGenerator;
+    if (!NativeGenerator || typeof window.VideoFrame !== 'function') {
+      logger.warn('[WGC] MediaStreamTrackGenerator/VideoFrame unavailable in this Electron runtime');
+      return;
+    }
+    if (!window.electron?.onWgcFrame || !window.electron?.startNativeCapture || !this.videoProducer?.rtpSender) {
+      logger.warn('[WGC] Native frame bridge unavailable; staying on Chromium capture');
+      return;
+    }
+
+    try {
+      const nativeTrack = new NativeGenerator({ kind: 'video' });
+      const writer = nativeTrack.writable.getWriter();
+      const profile = this.getActiveQualityProfile();
+
+      this._nativeVideoTrack = nativeTrack;
+      this._nativeVideoWriter = writer;
+      this._nativeFrameWritePending = false;
+      this._nativeFrameTimestampUs = 0;
+
+      window.electron.onWgcFrame(async (buffer, meta) => {
+        if (!this._nativeVideoWriter || this._nativeFrameWritePending) return;
+        try {
+          this._nativeFrameWritePending = true;
+          const pixels = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+          this._nativeFrameTimestampUs += Math.round(1000000 / Math.max(1, profile.maxFrameRate || 60));
+          const frame = new VideoFrame(pixels, {
+            format: 'BGRA',
+            codedWidth: meta.width,
+            codedHeight: meta.height,
+            timestamp: this._nativeFrameTimestampUs,
+          });
+          await this._nativeVideoWriter.write(frame);
+          frame.close();
+        } catch (error) {
+          if (!this._wgcWriteWarned) {
+            this._wgcWriteWarned = true;
+            logger.warn('[WGC] Native frame write failed: ' + error.message);
+          }
+        } finally {
+          this._nativeFrameWritePending = false;
+        }
+      });
+
+      const nativeResult = await window.electron.startNativeCapture({
+        hwnd: gameHwnd,
+        width: profile.maxWidth,
+        height: profile.maxHeight,
+        fps: profile.maxFrameRate,
+      });
+
+      if (!nativeResult?.success) {
+        logger.warn('[WGC] Native capture start failed: ' + (nativeResult?.reason || 'unknown'));
+        this._teardownNativeWgc();
+        return;
+      }
+
+      await this.videoProducer.rtpSender.replaceTrack(nativeTrack);
+      if (fallbackStream?.removeTrack) {
+        fallbackStream.removeTrack(fallbackTrack);
+      }
+      fallbackTrack.stop();
+      logger.info('[WGC] Native track generator attached — producer switched off Chromium capture');
+    } catch (error) {
+      logger.warn('[WGC] Native pipeline setup failed: ' + error.message);
+      this._teardownNativeWgc();
+    }
+  }
+
+  _teardownNativeWgc() {
+    if (window.electron?.removeWgcFrameListener) {
+      window.electron.removeWgcFrameListener();
+    }
+    if (this._nativeVideoWriter) {
+      this._nativeVideoWriter.close().catch(() => {});
+      this._nativeVideoWriter = null;
+    }
+    if (this._nativeVideoTrack) {
+      this._nativeVideoTrack.stop();
+      this._nativeVideoTrack = null;
+    }
+    this._nativeFrameWritePending = false;
+    this._nativeFrameTimestampUs = 0;
+    this._wgcWriteWarned = false;
   }
 
   updateViewersList() {

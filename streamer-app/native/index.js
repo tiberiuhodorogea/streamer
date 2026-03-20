@@ -54,11 +54,52 @@ function stopCapture() {
   }
 }
 
+/**
+ * Register a callback to receive captured frames.
+ * Callback signature: (buffer: Uint8Array, meta: {width, height, frameIndex}) => void
+ * Called on the Node.js main thread each time WGC delivers a new frame.
+ */
+function registerFrameCallback(callback) {
+  if (!addon || typeof addon.registerFrameCallback !== 'function') {
+    throw new Error('Native capture addon not available');
+  }
+  return addon.registerFrameCallback(callback);
+}
+
+function isProcessAudioSupported() {
+  return !!(addon && typeof addon.isProcessAudioSupported === 'function' && addon.isProcessAudioSupported());
+}
+
+function startProcessAudioCapture(pid) {
+  if (!addon || typeof addon.startProcessAudioCapture !== 'function') {
+    throw new Error('Native process audio capture not available');
+  }
+  return addon.startProcessAudioCapture(pid);
+}
+
+function stopProcessAudioCapture() {
+  if (addon && typeof addon.stopProcessAudioCapture === 'function') {
+    return addon.stopProcessAudioCapture();
+  }
+}
+
+function registerAudioCallback(callback) {
+  if (!addon || typeof addon.registerAudioCallback !== 'function') {
+    throw new Error('Native process audio capture not available');
+  }
+  return addon.registerAudioCallback(callback);
+}
+
 module.exports = {
   enumGameWindows,
   isSupported,
   startCapture,
   stopCapture,
+  registerFrameCallback,
+  isProcessAudioSupported,
+  startProcessAudioCapture,
+  stopProcessAudioCapture,
+  registerAudioCallback,
   /** True if the compiled .node binary loaded successfully */
   available: !!addon,
 };

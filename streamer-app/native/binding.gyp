@@ -6,6 +6,7 @@
     "sources": [
       "src/addon.cpp",
       "src/game_detect.cpp",
+      "src/process_audio.cpp",
       "src/wgc_capture.cpp"
     ],
     "include_dirs": [
@@ -28,9 +29,12 @@
         },
         "libraries": [
           "-lwindowsapp.lib",
+          "-lavrt.lib",
           "-ld3d11.lib",
           "-ldxgi.lib",
+          "-lole32.lib",
           "-lpsapi.lib"
+          ,"-lpropsys.lib"
         ]
       }]
     ]

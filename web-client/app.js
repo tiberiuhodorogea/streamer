@@ -219,8 +219,21 @@ class ViewerApp {
     this._prevFramesDecoded = 0;
     this._prevStatsTimestamp = 0;
 
+    this.prefillServerUrl();
     this.initializeUI();
     debugConsole.info('Viewer app initialized (SFU mode)');
+  }
+
+  prefillServerUrl() {
+    const input = document.getElementById('serverUrl');
+    if (!input) return;
+
+    const isDefaultLocal = !input.value || /localhost|127\.0\.0\.1/i.test(input.value);
+    if (!isDefaultLocal) return;
+
+    const wsScheme = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const host = window.location.hostname || 'localhost';
+    input.value = wsScheme + host + ':4000';
   }
 
   initializeUI() {
@@ -372,6 +385,11 @@ class ViewerApp {
     this.socket.on('consumer-closed', (data) => {
       const consumer = this.consumers.get(data.consumerId);
       if (consumer) {
+        // Remove the dead track from remoteStream so the <video> element
+        // can switch to any new track that gets added.
+        if (this.remoteStream && consumer.track) {
+          try { this.remoteStream.removeTrack(consumer.track); } catch (_) {}
+        }
         consumer.close();
         this.consumers.delete(data.consumerId);
         debugConsole.info('[SFU] Consumer closed: ' + data.consumerId);
@@ -434,6 +452,9 @@ class ViewerApp {
   }
 
   joinStreamer(streamer) {
+    if (this.selectedStreamer) {
+      this.removeConnection();
+    }
     debugConsole.info('Joining ' + (streamer.name || streamer.id));
     this.selectedStreamer = streamer.id;
     this.selectedStreamerName = streamer.name || streamer.id;
@@ -450,6 +471,10 @@ class ViewerApp {
   }
 
   async setupMediasoup(routerRtpCapabilities) {
+    if (this.recvTransport || this.consumers.size > 0 || this.remoteStream) {
+      this.removeConnection();
+    }
+
     this.device = new mediasoupClient.Device();
     await this.device.load({ routerRtpCapabilities });
     debugConsole.info('[SFU] Device loaded with router capabilities');
@@ -766,6 +791,7 @@ class ViewerApp {
 
   removeConnection() {
     if (this.statsInterval) clearInterval(this.statsInterval);
+    this.statsInterval = null;
 
     // Close all consumers
     for (const consumer of this.consumers.values()) {
@@ -797,6 +823,9 @@ class ViewerApp {
     this._prevBytesReceived = 0;
     this._prevFramesDecoded = 0;
     this._prevStatsTimestamp = 0;
+    this._prevPacketsLost = 0;
+    this._prevPacketsReceived = 0;
+    this._zeroFpsCount = 0;
     this.syncFullscreenButton();
   }
 

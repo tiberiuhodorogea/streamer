@@ -41,10 +41,23 @@
             </select>
           </div>
           <div class="profile-summary" id="profileSummary">1080p / 60 fps / 18 Mbps cap</div>
+          <div class="form-group bitrate-slider-group">
+            <label>Bitrate Cap: <span id="bitrateValue" class="bitrate-value">18 Mbps</span></label>
+            <input type="range" id="bitrateSlider" min="10" max="30" step="1" value="18">
+            <div class="slider-range"><span>10 Mbps</span><span>30 Mbps</span></div>
+          </div>
         </div>
         <label class="toggle-row" for="includeAudio">
           <span>Include source audio</span>
           <input type="checkbox" id="includeAudio" checked>
+        </label>
+        <label class="toggle-row" for="enableExperimentalWgc">
+          <span>Experimental Native WGC</span>
+          <input type="checkbox" id="enableExperimentalWgc">
+        </label>
+        <label class="toggle-row" for="useCustomGameAbr">
+          <span>Custom Game ABR</span>
+          <input type="checkbox" id="useCustomGameAbr" checked>
         </label>
         <button id="connectBtn" class="btn btn-primary">Connect to Server</button>
       </section>

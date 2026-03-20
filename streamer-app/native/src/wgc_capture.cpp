@@ -1,9 +1,9 @@
 /**
- * Windows Graphics Capture (WGC) implementation.
+ * Windows Graphics Capture (WGC) implementation with frame delivery.
  *
- * Uses the WinRT Windows.Graphics.Capture API to capture individual windows
- * by HWND — including DirectX/Vulkan game windows in windowed or borderless
- * fullscreen mode.
+ * Captures game windows via WinRT WGC API and delivers BGRA pixel buffers
+ * to Node.js through a ThreadSafeFunction callback. Bypasses DWM compositing
+ * for lower latency and true vsync-aligned frame delivery.
  *
  * Requirements:
  *   - Windows 10 version 1903 (build 18362) or later
@@ -19,10 +19,8 @@
 #include <cstdio>
 #include <mutex>
 #include <atomic>
+#include <cstdlib>
 
-// ────────────────────────────────────────────────────────────
-// C++/WinRT includes for Windows Graphics Capture
-// ────────────────────────────────────────────────────────────
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.Capture.h>
@@ -31,15 +29,11 @@
 #include <windows.graphics.capture.interop.h>
 #include <winrt/base.h>
 
-// IDirect3DDxgiInterfaceAccess — interop interface for extracting
-// the underlying DXGI resource from a WinRT Direct3D surface.
-// Defined inline for portability across SDK versions.
 struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1"))
 IDirect3DDxgiInterfaceAccess : ::IUnknown {
     virtual HRESULT __stdcall GetInterface(REFIID riid, void** ppv) = 0;
 };
 
-// CreateDirect3D11DeviceFromDXGIDevice — create WinRT device wrapper
 extern "C" HRESULT __stdcall CreateDirect3D11DeviceFromDXGIDevice(
     IDXGIDevice* dxgiDevice, IInspectable** graphicsDevice);
 
@@ -47,6 +41,43 @@ namespace wrt = winrt;
 namespace wgc = winrt::Windows::Graphics::Capture;
 namespace wdx = winrt::Windows::Graphics::DirectX;
 namespace wd3d = winrt::Windows::Graphics::DirectX::Direct3D11;
+
+static std::atomic<bool> g_framePending{false};
+
+// ────────────────────────────────────────────────────────────
+// Frame data passed through the ThreadSafeFunction
+// ────────────────────────────────────────────────────────────
+struct FrameData {
+    uint8_t* pixels;      // heap-allocated BGRA, ownership transferred
+    uint32_t dataSize;
+    uint32_t width;
+    uint32_t height;
+    uint64_t frameIndex;
+};
+
+// TSFN callback — runs on Node.js main thread
+static void onFrameDelivery(Napi::Env env, Napi::Function fn, std::nullptr_t*, FrameData* data) {
+    if (!data) return;
+    if (env != nullptr && fn != nullptr) {
+        // Create ArrayBuffer that takes ownership of the pixel data
+        auto ab = Napi::ArrayBuffer::New(env, data->pixels, data->dataSize,
+            [](Napi::Env, void* p) { free(p); });
+        auto view = Napi::Uint8Array::New(env, data->dataSize, ab, 0);
+
+        auto meta = Napi::Object::New(env);
+        meta.Set("width", Napi::Number::New(env, data->width));
+        meta.Set("height", Napi::Number::New(env, data->height));
+        meta.Set("frameIndex", Napi::Number::New(env, static_cast<double>(data->frameIndex)));
+
+        fn.Call({view, meta});
+    } else {
+        free(data->pixels);
+    }
+    g_framePending.store(false, std::memory_order_release);
+    delete data;
+}
+
+using FrameTSFN = Napi::TypedThreadSafeFunction<std::nullptr_t, FrameData, onFrameDelivery>;
 
 // ────────────────────────────────────────────────────────────
 // Capture session state (singleton — one capture at a time)
@@ -71,6 +102,10 @@ static struct CaptureState {
     uint32_t width  = 0;
     uint32_t height = 0;
     uint64_t frameCount = 0;
+
+    // Frame delivery via TSFN
+    FrameTSFN tsfn;
+    std::atomic<bool> tsfnActive{false};
 } g_capture;
 
 // ────────────────────────────────────────────────────────────
@@ -82,10 +117,6 @@ static bool isWgcSupported() {
         L"Windows.Graphics.Capture.GraphicsCaptureSession");
 }
 
-/**
- * Create a D3D11 device and wrap it in the WinRT IDirect3DDevice interface
- * that the WGC API requires.
- */
 static bool createD3DDevice() {
     D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1,
@@ -108,12 +139,10 @@ static bool createD3DDevice() {
     g_capture.d3dDevice.attach(raw);
     g_capture.d3dContext.attach(ctx);
 
-    // Get IDXGIDevice from ID3D11Device
     wrt::com_ptr<IDXGIDevice> dxgiDevice;
     hr = raw->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void());
     if (FAILED(hr)) return false;
 
-    // Wrap in WinRT IDirect3DDevice
     wrt::com_ptr<::IInspectable> inspectable;
     hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(), inspectable.put());
     if (FAILED(hr)) return false;
@@ -122,9 +151,6 @@ static bool createD3DDevice() {
     return true;
 }
 
-/**
- * Create a CPU-readable staging texture matching the capture dimensions.
- */
 static bool createStagingTexture(uint32_t w, uint32_t h) {
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width            = w;
@@ -145,20 +171,28 @@ static bool createStagingTexture(uint32_t w, uint32_t h) {
 }
 
 /**
- * Frame-arrived callback. Runs on a thread-pool thread (FreeThreaded pool).
+ * Frame-arrived callback. Runs on a WGC thread-pool thread.
+ * Copies pixels to a heap buffer and delivers via TSFN to Node.js.
  */
 static void onFrameArrived(
     wgc::Direct3D11CaptureFramePool const& sender,
     wrt::Windows::Foundation::IInspectable const&)
 {
-    if (!g_capture.active.load()) return;
+    if (!g_capture.active.load(std::memory_order_relaxed)) return;
+
+    // Skip if previous frame hasn't been consumed yet (back-pressure)
+    if (g_framePending.load(std::memory_order_relaxed)) {
+        // Still drain the pool to avoid stalling WGC
+        auto frame = sender.TryGetNextFrame();
+        if (frame) frame.Close();
+        return;
+    }
 
     auto frame = sender.TryGetNextFrame();
     if (!frame) return;
 
     g_capture.frameCount++;
 
-    // Get the D3D texture from the captured frame's surface
     auto surface = frame.Surface();
     wrt::com_ptr<IDirect3DDxgiInterfaceAccess> access;
     HRESULT hr = wrt::get_unknown(surface)->QueryInterface(
@@ -169,20 +203,45 @@ static void onFrameArrived(
     hr = access->GetInterface(__uuidof(ID3D11Texture2D), frameTex.put_void());
     if (FAILED(hr)) { frame.Close(); return; }
 
-    // Copy to staging texture
+    // Copy GPU texture to CPU-readable staging texture
     g_capture.d3dContext->CopyResource(g_capture.stagingTexture.get(), frameTex.get());
 
-    // Map the staging texture to read pixels
+    // Map staging texture and copy pixels to a heap buffer
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     hr = g_capture.d3dContext->Map(g_capture.stagingTexture.get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        // mapped.pData contains BGRA pixel data, mapped.RowPitch is stride
-        // Frame data is available here for future IPC delivery.
-        // For now, we just count frames to validate the capture pipeline.
-        g_capture.d3dContext->Unmap(g_capture.stagingTexture.get(), 0);
+    if (FAILED(hr)) { frame.Close(); return; }
+
+    const uint32_t w = g_capture.width;
+    const uint32_t h = g_capture.height;
+    const uint32_t rowBytes = w * 4; // BGRA = 4 bytes/pixel
+    const uint32_t dataSize = rowBytes * h;
+
+    auto* pixels = static_cast<uint8_t*>(malloc(dataSize));
+    if (pixels) {
+        // Copy row-by-row to handle stride mismatch
+        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+        for (uint32_t y = 0; y < h; y++) {
+            memcpy(pixels + y * rowBytes, src + y * mapped.RowPitch, rowBytes);
+        }
     }
 
+    g_capture.d3dContext->Unmap(g_capture.stagingTexture.get(), 0);
     frame.Close();
+
+    // Deliver to Node.js via TSFN
+    if (pixels && g_capture.tsfnActive.load(std::memory_order_relaxed)) {
+        auto* fd = new FrameData{pixels, dataSize, w, h, g_capture.frameCount};
+        g_framePending.store(true, std::memory_order_release);
+        auto status = g_capture.tsfn.NonBlockingCall(fd);
+        if (status != napi_ok) {
+            // TSFN rejected (shutting down or queue full)
+            g_framePending.store(false, std::memory_order_release);
+            free(fd->pixels);
+            delete fd;
+        }
+    } else {
+        free(pixels);
+    }
 }
 
 // ────────────────────────────────────────────────────────────
@@ -193,6 +252,33 @@ Napi::Value wgc_capture::IsSupported(const Napi::CallbackInfo& info) {
     bool supported = false;
     try { supported = isWgcSupported(); } catch (...) {}
     return Napi::Boolean::New(info.Env(), supported);
+}
+
+Napi::Value wgc_capture::RegisterFrameCallback(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "Expected callback function").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // Release previous TSFN if any
+    if (g_capture.tsfnActive.load()) {
+        g_capture.tsfnActive.store(false);
+        g_capture.tsfn.Release();
+    }
+
+    g_capture.tsfn = FrameTSFN::New(
+        env,
+        info[0].As<Napi::Function>(),
+        "WgcFrameCallback",
+        0,    // unlimited queue
+        1     // initial thread count
+    );
+    g_capture.tsfnActive.store(true);
+    g_framePending.store(false);
+
+    return env.Undefined();
 }
 
 Napi::Value wgc_capture::StartCapture(const Napi::CallbackInfo& info) {
@@ -213,8 +299,7 @@ Napi::Value wgc_capture::StartCapture(const Napi::CallbackInfo& info) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(info[0].As<Napi::Number>().Int64Value()));
     uint32_t width  = info[1].As<Napi::Number>().Uint32Value();
     uint32_t height = info[2].As<Napi::Number>().Uint32Value();
-    // fps arg reserved for future frame-rate limiting
-    (void)info[3];
+    (void)info[3]; // fps reserved
 
     if (!IsWindow(hwnd)) {
         Napi::Error::New(env, "Invalid HWND").ThrowAsJavaScriptException();
@@ -223,16 +308,13 @@ Napi::Value wgc_capture::StartCapture(const Napi::CallbackInfo& info) {
 
     try {
         wrt::init_apartment(wrt::apartment_type::multi_threaded);
-    } catch (...) {
-        // Already initialized — fine
-    }
+    } catch (...) {}
 
     if (!isWgcSupported()) {
-        Napi::Error::New(env, "Windows Graphics Capture not supported (requires Win10 1903+)").ThrowAsJavaScriptException();
+        Napi::Error::New(env, "WGC not supported (requires Win10 1903+)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
 
-    // Create D3D device
     if (!createD3DDevice()) {
         Napi::Error::New(env, "Failed to create D3D11 device").ThrowAsJavaScriptException();
         return env.Undefined();
@@ -252,7 +334,6 @@ Napi::Value wgc_capture::StartCapture(const Napi::CallbackInfo& info) {
         }
         g_capture.item = item;
 
-        // Use the item's reported size if our requested size is 0
         auto size = item.Size();
         if (width == 0)  width  = static_cast<uint32_t>(size.Width);
         if (height == 0) height = static_cast<uint32_t>(size.Height);
@@ -266,18 +347,17 @@ Napi::Value wgc_capture::StartCapture(const Napi::CallbackInfo& info) {
     g_capture.width  = width;
     g_capture.height = height;
 
-    // Create staging texture
     if (!createStagingTexture(width, height)) {
         Napi::Error::New(env, "Failed to create staging texture").ThrowAsJavaScriptException();
         return env.Undefined();
     }
 
-    // Create frame pool (FreeThreaded — no DispatcherQueue needed)
+    // Create frame pool (FreeThreaded — fires on thread pool, no UI thread needed)
     try {
         g_capture.pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
             g_capture.winrtDevice,
             wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            1,  // buffer count
+            2,  // 2 buffers for smoother pipelining
             { static_cast<int32_t>(width), static_cast<int32_t>(height) });
 
         g_capture.frameToken = g_capture.pool.FrameArrived(onFrameArrived);
@@ -288,18 +368,18 @@ Napi::Value wgc_capture::StartCapture(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
-    // Start capture session
     try {
         g_capture.session = g_capture.pool.CreateCaptureSession(g_capture.item);
-        g_capture.session.IsBorderRequired(false);      // hide yellow capture border (Win11)
-    } catch (...) {
-        // IsBorderRequired may not be available on older builds — ignore
-    }
+        g_capture.session.IsBorderRequired(false);
+        // Exclude the OS cursor from captured frames (Win10 2004+ / build 19041+)
+        try { g_capture.session.IsCursorCaptureEnabled(false); } catch (...) {}
+    } catch (...) {}
 
     try {
         g_capture.session.StartCapture();
         g_capture.active.store(true);
         g_capture.frameCount = 0;
+        g_framePending.store(false);
     } catch (wrt::hresult_error const& e) {
         std::string msg = "WGC StartCapture failed: ";
         msg += wrt::to_string(e.message());
@@ -314,6 +394,13 @@ Napi::Value wgc_capture::StopCapture(const Napi::CallbackInfo& info) {
     std::lock_guard<std::mutex> lock(g_capture.mtx);
 
     g_capture.active.store(false);
+
+    // Release TSFN
+    if (g_capture.tsfnActive.load()) {
+        g_capture.tsfnActive.store(false);
+        g_capture.tsfn.Release();
+    }
+    g_framePending.store(false);
 
     try {
         if (g_capture.session) {

@@ -10,6 +10,7 @@
 
 #include <napi.h>
 #include "game_detect.h"
+#include "process_audio.h"
 #include "wgc_capture.h"
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -24,6 +25,21 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
     exports.Set("stopCapture",
         Napi::Function::New(env, wgc_capture::StopCapture));
+
+    exports.Set("registerFrameCallback",
+        Napi::Function::New(env, wgc_capture::RegisterFrameCallback));
+
+    exports.Set("isProcessAudioSupported",
+        Napi::Function::New(env, process_audio::IsSupported));
+
+    exports.Set("startProcessAudioCapture",
+        Napi::Function::New(env, process_audio::StartCapture));
+
+    exports.Set("stopProcessAudioCapture",
+        Napi::Function::New(env, process_audio::StopCapture));
+
+    exports.Set("registerAudioCallback",
+        Napi::Function::New(env, process_audio::RegisterAudioCallback));
 
     return exports;
 }

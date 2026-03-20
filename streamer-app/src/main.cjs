@@ -2,6 +2,13 @@ const { app, BrowserWindow, ipcMain, desktopCapturer } = require('electron');
 const { execFileSync } = require('child_process');
 const path = require('path');
 
+// Force Chromium to use Windows Graphics Capture (WGC) for window capture.
+// Without this, Chromium may fall back to GDI-based capture which cannot
+// capture DirectX/Vulkan game surfaces.
+app.commandLine.appendSwitch('enable-features',
+  'WebRtcAllowWgcWindowCapturer,WebRtcAllowWgcScreenCapturer');
+app.commandLine.appendSwitch('enable-blink-features', 'BreakoutBox');
+
 let mainWindow;
 const APP_CAPTURE_NAMES = new Set(['Streamer Studio', 'P2P Stream - Streamer']);
 const SHOULD_OPEN_DEVTOOLS = process.env.STREAMER_DEVTOOLS === '1';
@@ -34,7 +41,7 @@ const WELL_KNOWN_NON_GAMES = [
 
 /**
  * Detects windows belonging to game processes by checking loaded DirectX/Vulkan modules.
- * Returns Map<hwndString, processName>.
+ * Returns Map<hwndString, { name, pid }>.
  */
 function detectGameHwnds() {
   // If native addon is available, use it (faster, no PowerShell startup)
@@ -47,7 +54,7 @@ function detectGameHwnds() {
         // Apply JS-level exclusion list (catches anything the native list missed)
         const nameLower = (item.name || '').toLowerCase().replace(/\.exe$/i, '');
         if (WELL_KNOWN_NON_GAMES.includes(nameLower)) continue;
-        map.set(String(item.hwnd), item.name);
+        map.set(String(item.hwnd), { name: item.name, pid: item.pid || null });
       }
       return map;
     } catch (e) {
@@ -65,7 +72,7 @@ function detectGameHwnds() {
       '  if($skip -contains $_.ProcessName.ToLower()){return}',
       '  try{foreach($m in $_.Modules){',
       '    if($m.ModuleName -match "^(d3d1[12]|vulkan-1)\\.dll$"){',
-      '      $r+=@{h=$_.MainWindowHandle.ToInt64();n=$_.ProcessName}',
+      '      $r+=@{h=$_.MainWindowHandle.ToInt64();n=$_.ProcessName;p=$_.Id}',
       '      break',
       '    }',
       '  }}catch{}',
@@ -84,7 +91,9 @@ function detectGameHwnds() {
     const arr = Array.isArray(data) ? data : [data];
     const map = new Map();
     for (const item of arr) {
-      if (item && item.h != null) map.set(String(item.h), item.n);
+      if (item && item.h != null) {
+        map.set(String(item.h), { name: item.n, pid: item.p || null });
+      }
     }
     return map;
   } catch (err) {
@@ -146,7 +155,7 @@ ipcMain.handle('get-capture-sources', async () => {
       gameHwnds = detectGameHwnds();
       if (gameHwnds.size > 0) {
         console.log('[GAME-DETECT] Found ' + gameHwnds.size + ' game window(s): ' +
-          [...gameHwnds.values()].join(', '));
+          [...gameHwnds.values()].map(item => item.name).join(', '));
       }
     } catch (e) {
       console.warn('[GAME-DETECT] Detection skipped:', e.message);
@@ -165,7 +174,9 @@ ipcMain.handle('get-capture-sources', async () => {
           kind: source.id.startsWith('window:') ? 'window' : 'screen',
           thumbnail: source.thumbnail.toDataURL(),
           isGame: !!gameProcess,
-          gameProcess,
+          gameProcess: gameProcess ? gameProcess.name : null,
+          gamePid: gameProcess ? gameProcess.pid : null,
+          gameHwnd: gameProcess && hwnd ? parseInt(hwnd) : null,
         };
       });
   } catch (error) {
@@ -179,14 +190,31 @@ ipcMain.handle('native-capture-available', () => {
   return !!(nativeCapture && typeof nativeCapture.startCapture === 'function');
 });
 
-// IPC Handler: Start native game capture
+ipcMain.handle('native-process-audio-available', () => {
+  return !!(nativeCapture && typeof nativeCapture.startProcessAudioCapture === 'function');
+});
+
+// IPC Handler: Start native game capture with frame delivery
 ipcMain.handle('start-native-capture', async (_event, { hwnd, width, height, fps }) => {
   if (!nativeCapture || typeof nativeCapture.startCapture !== 'function') {
     return { success: false, reason: 'not-available' };
   }
   try {
+    // Register frame callback — forwards BGRA frames to renderer via IPC
+    if (typeof nativeCapture.registerFrameCallback === 'function') {
+      nativeCapture.registerFrameCallback((pixels, meta) => {
+        try {
+          if (!mainWindow || mainWindow.isDestroyed()) return;
+          mainWindow.webContents.send('wgc-frame', pixels.buffer, meta);
+        } catch (error) {
+          console.warn('[NATIVE] WGC frame forwarding failed:', error.message);
+        }
+      });
+      console.log('[NATIVE] Frame callback registered — frames will be forwarded to renderer');
+    }
+
     nativeCapture.startCapture(parseInt(hwnd), width, height, fps || 60);
-    console.log('[NATIVE] Capture started for HWND ' + hwnd + ' (' + width + 'x' + height + '@' + (fps || 60) + ')');
+    console.log('[NATIVE] WGC capture started for HWND ' + hwnd + ' (' + width + 'x' + height + '@' + (fps || 60) + ')');
     return { success: true };
   } catch (err) {
     console.error('[NATIVE] Start failed:', err.message);
@@ -199,6 +227,56 @@ ipcMain.handle('stop-native-capture', async () => {
   if (!nativeCapture) return { success: false };
   try {
     if (typeof nativeCapture.stopCapture === 'function') nativeCapture.stopCapture();
+    return { success: true };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+});
+
+ipcMain.handle('start-native-process-audio', async (_event, { pid }) => {
+  console.log('[AUDIO-IPC] start-native-process-audio called, pid=' + pid);
+  if (!nativeCapture || typeof nativeCapture.startProcessAudioCapture !== 'function') {
+    console.warn('[AUDIO-IPC] Native capture module unavailable (nativeCapture=' + !!nativeCapture + ', hasFunc=' + (typeof nativeCapture?.startProcessAudioCapture) + ')');
+    return { success: false, reason: 'not-available' };
+  }
+  try {
+    if (typeof nativeCapture.registerAudioCallback === 'function') {
+      let chunkCount = 0;
+      nativeCapture.registerAudioCallback((samples, meta) => {
+        try {
+          if (!mainWindow || mainWindow.isDestroyed()) return;
+          chunkCount++;
+          if (chunkCount === 1) {
+            console.log('[AUDIO-IPC] First audio chunk received: frames=' + meta.frameCount + ' rate=' + meta.sampleRate + ' ch=' + meta.channels + ' bytes=' + samples.byteLength);
+          } else if (chunkCount % 500 === 0) {
+            console.log('[AUDIO-IPC] Audio chunk #' + chunkCount + ': frames=' + meta.frameCount);
+          }
+          mainWindow.webContents.send('game-audio-chunk', samples.buffer, meta);
+        } catch (error) {
+          console.warn('[AUDIO-IPC] Game audio forwarding failed:', error.message);
+        }
+      });
+      console.log('[AUDIO-IPC] Audio callback registered');
+    } else {
+      console.warn('[AUDIO-IPC] registerAudioCallback not available on nativeCapture');
+    }
+
+    console.log('[AUDIO-IPC] Calling startProcessAudioCapture(' + parseInt(pid, 10) + ')...');
+    const format = nativeCapture.startProcessAudioCapture(parseInt(pid, 10));
+    console.log('[AUDIO-IPC] startProcessAudioCapture returned:', JSON.stringify(format));
+    return { success: true, format };
+  } catch (err) {
+    console.error('[AUDIO-IPC] Process audio start FAILED:', err.message);
+    return { success: false, reason: err.message };
+  }
+});
+
+ipcMain.handle('stop-native-process-audio', async () => {
+  if (!nativeCapture || typeof nativeCapture.stopProcessAudioCapture !== 'function') {
+    return { success: false, reason: 'not-available' };
+  }
+  try {
+    nativeCapture.stopProcessAudioCapture();
     return { success: true };
   } catch (err) {
     return { success: false, reason: err.message };

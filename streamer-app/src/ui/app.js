@@ -1,4 +1,4 @@
-﻿// ============================================
+// ============================================
 // SIGNALING CLIENT WITH AUTO-RECONNECT
 // ============================================
 class SignalClient {
@@ -14,6 +14,8 @@ class SignalClient {
     this._maxReconnectDelay = options.reconnectionDelayMax || 15000;
     this._shouldReconnect = options.reconnection !== false;
     this._intentionalClose = false;
+    this._reqCounter = 0;
+    this._pendingRequests = new Map();
     this.connect();
   }
 
@@ -34,6 +36,21 @@ class SignalClient {
           const data = JSON.parse(event.data);
           if (!Array.isArray(data) || data.length < 2) return;
           const [eventName, eventData] = data;
+
+          // Handle request/response pattern
+          if (eventName === 'response' && eventData._reqId != null) {
+            const pending = this._pendingRequests.get(eventData._reqId);
+            if (pending) {
+              this._pendingRequests.delete(eventData._reqId);
+              if (eventData.error) {
+                pending.reject(new Error(eventData.error));
+              } else {
+                pending.resolve(eventData);
+              }
+              return;
+            }
+          }
+
           this._fireListeners(eventName, eventData);
         } catch (err) {
           logger?.error?.('Parse error: ' + err.message);
@@ -47,6 +64,10 @@ class SignalClient {
 
       this.ws.onclose = () => {
         logger?.warn?.('WebSocket closed');
+        for (const [id, pending] of this._pendingRequests) {
+          pending.reject(new Error('Connection closed'));
+        }
+        this._pendingRequests.clear();
         this._fireListeners('disconnect');
         if (this._shouldReconnect && !this._intentionalClose) {
           this._scheduleReconnect();
@@ -67,7 +88,6 @@ class SignalClient {
       return;
     }
     this._reconnectAttempts++;
-    // Exponential backoff with jitter
     const base = Math.min(this._reconnectDelay * Math.pow(1.5, this._reconnectAttempts - 1), this._maxReconnectDelay);
     const jitter = base * 0.2 * Math.random();
     const delay = Math.round(base + jitter);
@@ -89,9 +109,27 @@ class SignalClient {
     }
   }
 
+  async request(event, data = {}) {
+    return new Promise((resolve, reject) => {
+      const reqId = ++this._reqCounter;
+      this._pendingRequests.set(reqId, { resolve, reject });
+      this.emit(event, { ...data, _reqId: reqId });
+      setTimeout(() => {
+        if (this._pendingRequests.has(reqId)) {
+          this._pendingRequests.delete(reqId);
+          reject(new Error('Request timeout: ' + event));
+        }
+      }, 15000);
+    });
+  }
+
   close() {
     this._intentionalClose = true;
     this._shouldReconnect = false;
+    for (const [id, pending] of this._pendingRequests) {
+      pending.reject(new Error('Client closing'));
+    }
+    this._pendingRequests.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -174,7 +212,6 @@ const QUALITY_PROFILES = {
     maxHeight: 720,
     maxFrameRate: 60,
     maxBitrate: 8_000_000,
-    degradationPreference: 'balanced'
   },
   balanced: {
     label: 'Balanced',
@@ -184,7 +221,6 @@ const QUALITY_PROFILES = {
     maxHeight: 1080,
     maxFrameRate: 60,
     maxBitrate: 16_000_000,
-    degradationPreference: 'balanced'
   },
   quality: {
     label: 'Quality',
@@ -194,25 +230,20 @@ const QUALITY_PROFILES = {
     maxHeight: 1080,
     maxFrameRate: 60,
     maxBitrate: 24_000_000,
-    degradationPreference: 'balanced'
   }
 };
 
-const ICE_SERVERS = [
-  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-  { urls: ['stun:stun2.l.google.com:19302', 'stun:stun3.l.google.com:19302'] },
-  { urls: ['stun:stun4.l.google.com:19302'] }
-];
-
 // ============================================
-// STREAMER APP
+// STREAMER APP (SFU MODE)
 // ============================================
 class StreamerApp {
   constructor() {
     try {
       this.socket = null;
-      this.peers = new Map();
-      this.peerSnapshots = new Map();
+      this.device = null;          // mediasoup Device
+      this.sendTransport = null;   // mediasoup SendTransport
+      this.videoProducer = null;   // mediasoup Producer (video)
+      this.audioProducer = null;   // mediasoup Producer (audio)
       this.localStream = null;
       this.captureProfile = null;
       this.selectedProfileKey = 'balanced';
@@ -221,8 +252,12 @@ class StreamerApp {
       this.streamerName = '';
       this.serverUrl = '';
       this.statsInterval = null;
+      this.viewers = new Map();    // viewerId -> { name }
+      this._prevBytesSent = 0;
+      this._prevFramesEncoded = 0;
+      this._prevStatsTimestamp = 0;
 
-      logger.info('StreamerApp initializing...');
+      logger.info('StreamerApp initializing (SFU mode)...');
       this.attachEventListeners();
       logger.info('Event listeners attached');
     } catch (err) {
@@ -272,11 +307,26 @@ class StreamerApp {
     this.refreshQualityProfileUi();
     logger.info('Quality profile set to ' + QUALITY_PROFILES[profileKey].label);
 
-    if (this.localStream) {
-      this.applyLiveProfile().catch((error) => {
-        logger.warn('Could not fully apply live profile: ' + error.message);
+    if (this.videoProducer) {
+      this.updateProducerEncoding().catch((error) => {
+        logger.warn('Could not update producer encoding: ' + error.message);
       });
     }
+  }
+
+  async updateProducerEncoding() {
+    if (!this.videoProducer || !this.videoProducer.rtpSender) return;
+
+    const profile = this.getActiveQualityProfile();
+    const sender = this.videoProducer.rtpSender;
+    const params = sender.getParameters();
+    if (!params.encodings?.length) return;
+
+    params.encodings[0].maxBitrate = profile.maxBitrate;
+    params.encodings[0].maxFramerate = profile.maxFrameRate;
+
+    await sender.setParameters(params);
+    logger.info('[SFU] Updated producer encoding: maxBitrate=' + (profile.maxBitrate / 1000000) + 'Mbps maxFps=' + profile.maxFrameRate);
   }
 
   refreshQualityProfileUi() {
@@ -317,7 +367,6 @@ class StreamerApp {
       return;
     }
 
-    // Close existing connection if any
     if (this.socket) {
       this.socket.close();
       this.socket = null;
@@ -337,8 +386,18 @@ class StreamerApp {
       logger.info('CONNECTED TO SERVER');
       this.setStatus('Connected', 'green');
       this.socket.emit('register-streamer', { name: streamerName });
-      this.showCapturePanel();
-      this.loadCaptureSources();
+    });
+
+    this.socket.on('registered', async (data) => {
+      logger.info('Registered as streamer — setting up SFU transport');
+      try {
+        await this.setupMediasoup(data.routerRtpCapabilities);
+        this.showCapturePanel();
+        this.loadCaptureSources();
+      } catch (error) {
+        logger.error('SFU setup failed: ' + error.message);
+        this.setStatus('SFU Error', 'red');
+      }
     });
 
     this.socket.on('reconnecting', (info) => {
@@ -362,26 +421,70 @@ class StreamerApp {
     });
 
     this.socket.on('viewer-joined', (data) => {
-      logger.info('Viewer joined: ' + (data.viewerName || 'Unknown'));
-      this.handleViewerJoined(data);
+      logger.info('Viewer joined: ' + (data.viewerName || 'Unknown') + ' (SFU handles connection)');
+      this.viewers.set(data.viewerId, { name: data.viewerName || 'Unknown' });
+      this.updateViewersList();
     });
 
     this.socket.on('viewer-left', (data) => {
       logger.info('Viewer left');
-      this.handleViewerLeft(data);
-    });
-
-    this.socket.on('answer', (data) => {
-      this.handleAnswer(data);
-    });
-
-    this.socket.on('ice-candidate', (data) => {
-      this.handleIceCandidate(data);
+      this.viewers.delete(data.viewerId);
+      this.updateViewersList();
     });
 
     this.socket.on('viewer-quality-report', (data) => {
-      this.handleViewerQualityReport(data);
+      // Just log for diagnostics — no adaptation needed, SFU handles forwarding
+      if (!this._qrLogCounter) this._qrLogCounter = 0;
+      this._qrLogCounter++;
+      if (this._qrLogCounter % 5 === 0) {
+        const viewer = this.viewers.get(data.viewerId);
+        const name = viewer ? viewer.name : data.viewerId;
+        logger.debug('[DIAG:QR] ' + name + ' | fps=' + data.fps + ' bitrate=' + data.bitrateMbps + 'Mbps res=' + data.frameWidth + 'x' + data.frameHeight);
+      }
     });
+  }
+
+  async setupMediasoup(routerRtpCapabilities) {
+    this.device = new mediasoupClient.Device();
+    await this.device.load({ routerRtpCapabilities });
+    logger.info('[SFU] Device loaded with router capabilities');
+
+    // Create send transport
+    const transportData = await this.socket.request('create-producer-transport');
+
+    this.sendTransport = this.device.createSendTransport({
+      id: transportData.id,
+      iceParameters: transportData.iceParameters,
+      iceCandidates: transportData.iceCandidates,
+      dtlsParameters: transportData.dtlsParameters,
+    });
+
+    this.sendTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+      try {
+        await this.socket.request('connect-producer-transport', { dtlsParameters });
+        callback();
+      } catch (error) {
+        errback(error);
+      }
+    });
+
+    this.sendTransport.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
+      try {
+        const response = await this.socket.request('produce', { kind, rtpParameters });
+        callback({ id: response.producerId });
+      } catch (error) {
+        errback(error);
+      }
+    });
+
+    this.sendTransport.on('connectionstatechange', (state) => {
+      logger.info('[SFU] Send transport state: ' + state);
+      if (state === 'failed') {
+        logger.error('[SFU] Send transport failed — stream may be interrupted');
+      }
+    });
+
+    logger.info('[SFU] Send transport created — ready to produce');
   }
 
   async loadCaptureSources() {
@@ -437,14 +540,42 @@ class StreamerApp {
         logger.info(
           '[DIAG:CAPTURE] actual=' + settings.width + 'x' + settings.height + '@' + Math.round(settings.frameRate || 60) + 'fps' +
           ' | profile=' + prof.label + ' maxRes=' + prof.maxWidth + 'x' + prof.maxHeight +
-          ' maxBitrate=' + (prof.maxBitrate / 1000000) + 'Mbps degradPref=' + prof.degradationPreference
+          ' maxBitrate=' + (prof.maxBitrate / 1000000) + 'Mbps'
         );
+
+        // Produce video via SFU transport (single encoder for ALL viewers!)
+        this.videoProducer = await this.sendTransport.produce({
+          track: videoTrack,
+          encodings: [{
+            maxBitrate: prof.maxBitrate,
+            maxFramerate: prof.maxFrameRate,
+          }],
+          codecOptions: {
+            videoGoogleStartBitrate: 1000,
+          },
+        });
+
+        logger.info('[SFU] Video producer created (id: ' + this.videoProducer.id + ')');
+
+        this.videoProducer.on('transportclose', () => {
+          logger.warn('[SFU] Video producer transport closed');
+          this.videoProducer = null;
+        });
       }
 
+      // Produce audio
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length > 0) {
-        logger.info('Audio capture active (' + audioTracks.length + ' track)');
+        this.audioProducer = await this.sendTransport.produce({
+          track: audioTracks[0],
+        });
+        logger.info('[SFU] Audio producer created (id: ' + this.audioProducer.id + ')');
         this.updateAudioStatus('Live');
+
+        this.audioProducer.on('transportclose', () => {
+          logger.warn('[SFU] Audio producer transport closed');
+          this.audioProducer = null;
+        });
       } else {
         logger.warn('Audio capture unavailable for this source');
         this.updateAudioStatus(this.includeAudio ? 'Unavailable' : 'Off');
@@ -453,7 +584,7 @@ class StreamerApp {
       this.localStream = stream;
       this.isBroadcasting = true;
       this.showStreamPanel();
-      this.updateStreamStatus('Streaming', 'green');
+      this.updateStreamStatus('Streaming (SFU)', 'green');
       this.updateStatsDisplay(null, null);
       this.hideCapturePanel();
 
@@ -464,7 +595,8 @@ class StreamerApp {
         };
       });
 
-      logger.info('Stream ready - waiting for viewers');
+      this.startStatsCollection();
+      logger.info('[SFU] Stream live — server forwards to all viewers (single encoder!)');
 
     } catch (error) {
       logger.error('Failed to start stream: ' + error.message);
@@ -505,326 +637,44 @@ class StreamerApp {
     }
   }
 
-  handleViewerJoined(data) {
-    const { viewerId, viewerName } = data;
-    logger.info('Setting up peer connection for: ' + viewerName);
+  startStatsCollection() {
+    if (this.statsInterval) clearInterval(this.statsInterval);
+    this._prevBytesSent = 0;
+    this._prevFramesEncoded = 0;
+    this._prevStatsTimestamp = 0;
 
-    if (!this.localStream) {
-      logger.error('Cannot create peer before stream is ready');
-      return;
-    }
+    this.statsInterval = setInterval(async () => {
+      if (!this.videoProducer) return;
 
-    try {
-      const pc = new RTCPeerConnection({
-        iceServers: ICE_SERVERS,
-        bundlePolicy: 'max-bundle',
-        sdpSemantics: 'unified-plan'
-      });
-
-      this.localStream.getTracks().forEach((track) => {
-        const sender = pc.addTrack(track, this.localStream);
-        if (track.kind === 'video') {
-          this.configureVideoSender(sender, viewerName);
-        }
-      });
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          this.socket.emit('ice-candidate', { targetId: viewerId, candidate: event.candidate });
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        const state = pc.connectionState;
-        logger.info('Peer ' + viewerName + ' state: ' + state);
-
-        if (state === 'failed') {
-          // Attempt ICE restart before dropping
-          this.attemptIceRestart(viewerId);
-        } else if (state === 'closed') {
-          this.removePeer(viewerId);
-        } else if (state === 'disconnected') {
-          // Give it a few seconds to recover before acting
-          setTimeout(() => {
-            const peer = this.peers.get(viewerId);
-            if (peer && peer.connection.connectionState === 'disconnected') {
-              this.attemptIceRestart(viewerId);
-            }
-          }, 3000);
-        }
-      };
-
-      this.peers.set(viewerId, {
-        id: viewerId,
-        name: viewerName,
-        status: 'connecting',
-        connection: pc,
-        lastReportAt: 0,
-        iceRestarts: 0,
-        videoSender: pc.getSenders().find((s) => s.track?.kind === 'video') || null
-      });
-      this.updateViewersList();
-      this.ensureStatsCollection();
-
-      // When a new peer joins, reconfigure ALL existing peers with adjusted bitrate budgets
-      this.reconfigureAllSenders();
-
-      this.createAndSendOffer(viewerId).catch((error) => {
-        logger.error('Offer creation failed for ' + viewerName + ': ' + error.message);
-      });
-    } catch (error) {
-      logger.error('Viewer join failed: ' + error.message);
-    }
-  }
-
-  async attemptIceRestart(viewerId) {
-    const peer = this.peers.get(viewerId);
-    if (!peer || !peer.connection) return;
-
-    if (peer.iceRestarts >= 2) {
-      logger.warn('Max ICE restarts reached for ' + peer.name + ', dropping peer');
-      this.removePeer(viewerId);
-      return;
-    }
-
-    peer.iceRestarts++;
-    logger.info('Attempting ICE restart for ' + peer.name + ' (attempt ' + peer.iceRestarts + ')');
-
-    try {
-      const offer = await peer.connection.createOffer({ iceRestart: true });
-      await peer.connection.setLocalDescription(offer);
-      this.socket.emit('offer', { viewerId, offer: peer.connection.localDescription });
-    } catch (error) {
-      logger.error('ICE restart failed for ' + peer.name + ': ' + error.message);
-      this.removePeer(viewerId);
-    }
-  }
-
-  async createAndSendOffer(viewerId) {
-    const peer = this.peers.get(viewerId);
-    if (!peer || !peer.connection) return;
-
-    const offer = await peer.connection.createOffer({
-      offerToReceiveAudio: false,
-      offerToReceiveVideo: false
-    });
-
-    await peer.connection.setLocalDescription(offer);
-    peer.status = 'offer-sent';
-    this.updateViewersList();
-
-    logger.info('Sending offer to ' + peer.name);
-    this.socket.emit('offer', { viewerId, offer: peer.connection.localDescription });
-  }
-
-  async configureVideoSender(sender, viewerName) {
-    if (!sender) return;
-
-    try {
-      const profile = this.getActiveQualityProfile();
-      const sourceWidth = this.captureProfile?.width || 1280;
-      const targetWidth = Math.min(sourceWidth, profile.maxWidth);
-      const scaleResolutionDownBy = sourceWidth > targetWidth ? sourceWidth / targetWidth : 1;
-
-      // Give each peer the full bitrate budget — Chrome's BWE will handle actual throughput.
-      // Dividing bitrate per peer just hurts quality without reducing encoder load.
-      const parameters = sender.getParameters();
-      parameters.degradationPreference = profile.degradationPreference;
-      parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
-      parameters.encodings[0].maxBitrate = profile.maxBitrate;
-      parameters.encodings[0].maxFramerate = profile.maxFrameRate;
-      parameters.encodings[0].priority = 'high';
-      parameters.encodings[0].networkPriority = 'high';
-
-      if (scaleResolutionDownBy > 1) {
-        parameters.encodings[0].scaleResolutionDownBy = scaleResolutionDownBy;
-      } else {
-        delete parameters.encodings[0].scaleResolutionDownBy;
-      }
-
-      await sender.setParameters(parameters);
-
-      const enc = parameters.encodings[0];
-      logger.info(
-        '[DIAG:SENDER] ' + viewerName + ' | profile=' + profile.label +
-        ' peers=' + this.peers.size + ' | maxBitrate=' + (enc.maxBitrate / 1000000).toFixed(1) + 'Mbps' +
-        ' maxFps=' + enc.maxFramerate +
-        ' scaleDown=' + (enc.scaleResolutionDownBy || 1).toFixed(2) +
-        ' degradPref=' + (parameters.degradationPreference || 'none')
-      );
-    } catch (error) {
-      logger.warn('Could not tune sender for ' + viewerName + ': ' + error.message);
-    }
-  }
-
-  async handleViewerQualityReport(data) {
-    const { viewerId, fps, jitterMs } = data;
-    const peer = this.peers.get(viewerId);
-    if (!peer) return;
-
-    // No custom adaptation — WebRTC's built-in BWE handles congestion.
-    // Just log for diagnostics.
-    const now = Date.now();
-    if (now - peer.lastReportAt < 900) return;
-    peer.lastReportAt = now;
-
-    if (!this._qrLogCounter) this._qrLogCounter = 0;
-    this._qrLogCounter++;
-    if (this._qrLogCounter % 5 === 0) {
-      logger.debug('[DIAG:QR] ' + peer.name + ' | fps=' + fps + ' jitter=' + Math.round(jitterMs || 0) + 'ms');
-    }
-  }
-
-  reconfigureAllSenders() {
-    const peerCount = this.peers.size;
-    logger.info('Reconfiguring all senders for ' + peerCount + ' peer(s)');
-    for (const peer of this.peers.values()) {
-      if (peer.videoSender) {
-        this.configureVideoSender(peer.videoSender, peer.name).catch((err) => {
-          logger.warn('Reconfigure failed for ' + peer.name + ': ' + err.message);
-        });
-      }
-    }
-  }
-
-  async applyLiveProfile() {
-    const profile = this.getActiveQualityProfile();
-    const videoTrack = this.localStream?.getVideoTracks?.()[0];
-
-    if (videoTrack) {
       try {
-        await videoTrack.applyConstraints({
-          width: { max: profile.maxWidth },
-          height: { max: profile.maxHeight },
-          frameRate: { max: profile.maxFrameRate }
+        const stats = await this.videoProducer.getStats();
+        let bitrateMbps = null;
+        let fps = null;
+
+        stats.forEach((report) => {
+          if (report.type === 'outbound-rtp' && report.kind === 'video') {
+            const now = report.timestamp;
+            const bytesSent = report.bytesSent || 0;
+            const framesEncoded = report.framesEncoded || 0;
+
+            if (this._prevStatsTimestamp > 0) {
+              const elapsed = (now - this._prevStatsTimestamp) / 1000;
+              if (elapsed > 0) {
+                bitrateMbps = ((bytesSent - this._prevBytesSent) * 8) / elapsed / 1000000;
+                fps = Math.round((framesEncoded - this._prevFramesEncoded) / elapsed);
+              }
+            }
+
+            this._prevBytesSent = bytesSent;
+            this._prevFramesEncoded = framesEncoded;
+            this._prevStatsTimestamp = now;
+          }
         });
-        logger.info('Applied capture constraints for ' + profile.label);
+
+        this.updateStatsDisplay(bitrateMbps, fps);
       } catch (error) {
-        logger.warn('Could not apply capture constraints: ' + error.message);
+        // Ignore transient stats errors
       }
-    }
-
-    for (const peer of this.peers.values()) {
-      const sender = peer.connection?.getSenders?.().find((s) => s.track?.kind === 'video');
-      await this.configureVideoSender(sender, peer.name);
-    }
-  }
-
-  async handleAnswer(data) {
-    const { viewerId, answer } = data;
-    const peer = this.peers.get(viewerId);
-    if (!peer || !peer.connection) {
-      logger.warn('Answer for unknown viewer ' + viewerId);
-      return;
-    }
-
-    try {
-      await peer.connection.setRemoteDescription(new RTCSessionDescription(answer));
-      peer.status = 'connected';
-      peer.iceRestarts = 0; // Reset restart counter on successful connection
-      this.updateViewersList();
-      this.ensureStatsCollection();
-      logger.info('Remote answer applied for ' + peer.name);
-    } catch (error) {
-      logger.error('Failed to apply answer for ' + peer.name + ': ' + error.message);
-    }
-  }
-
-  async handleIceCandidate(data) {
-    const { from, candidate } = data;
-    const peer = this.peers.get(from);
-    if (!peer || !peer.connection || !candidate) return;
-
-    try {
-      await peer.connection.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (error) {
-      logger.error('Failed to add ICE candidate for ' + peer.name + ': ' + error.message);
-    }
-  }
-
-  handleViewerLeft(data) {
-    this.removePeer(data.viewerId);
-  }
-
-  removePeer(viewerId) {
-    const peer = this.peers.get(viewerId);
-    if (!peer) return;
-
-    if (peer.connection) {
-      peer.connection.onicecandidate = null;
-      peer.connection.onconnectionstatechange = null;
-      peer.connection.close();
-    }
-
-    this.peers.delete(viewerId);
-    this.peerSnapshots.delete(viewerId);
-    this.updateViewersList();
-
-    if (this.peers.size === 0) {
-      this.stopStatsCollection();
-      this.updateStatsDisplay(null, null);
-    } else {
-      // Remaining peers get more bitrate budget now
-      this.reconfigureAllSenders();
-    }
-  }
-
-  updateViewersList() {
-    const count = this.peers.size;
-    const viewerCount = document.getElementById('viewerCount');
-    if (viewerCount) viewerCount.textContent = count;
-
-    const list = document.getElementById('viewersList');
-    if (list) {
-      list.innerHTML = '';
-      this.peers.forEach((peer, viewerId) => {
-        const item = document.createElement('div');
-        item.className = 'viewer-item';
-        item.innerHTML = '<span>' + (peer.name || viewerId.substring(0, 8)) + ' (' + (peer.status || 'idle') + ')</span>';
-        list.appendChild(item);
-      });
-    }
-  }
-
-  stopStreaming() {
-    logger.info('Stopping stream...');
-    if (this.localStream) {
-      this.localStream.getTracks().forEach(track => track.stop());
-      this.localStream = null;
-    }
-    this.captureProfile = null;
-    this.updateAudioStatus('Off');
-
-    this.stopStatsCollection();
-    this.updateStatsDisplay(null, null);
-
-    this.peers.forEach((peer, viewerId) => {
-      this.removePeer(viewerId);
-    });
-    this.peers.clear();
-    logger.info('Stream stopped');
-
-    this.isBroadcasting = false;
-    this.hideStreamPanel();
-    this.showCapturePanel();
-  }
-
-  updateStreamStatus(status) {
-    const el = document.getElementById('streamStatus');
-    if (el) el.textContent = status;
-  }
-
-  updateAudioStatus(status) {
-    const el = document.getElementById('audioStatus');
-    if (el) el.textContent = status;
-  }
-
-  ensureStatsCollection() {
-    if (this.statsInterval || this.peers.size === 0) return;
-    this.statsInterval = setInterval(() => {
-      this.collectOutboundStats().catch((error) => {
-        logger.error('Stats collection error: ' + error.message);
-      });
     }, 1000);
   }
 
@@ -835,59 +685,60 @@ class StreamerApp {
     }
   }
 
-  async collectOutboundStats() {
-    let totalBitrateMbps = 0;
-    let fpsSamples = [];
+  stopStreaming() {
+    logger.info('Stopping stream...');
 
-    for (const [viewerId, peer] of this.peers.entries()) {
-      if (!peer.connection) continue;
+    if (this.videoProducer) {
+      this.videoProducer.close();
+      this.videoProducer = null;
+    }
+    if (this.audioProducer) {
+      this.audioProducer.close();
+      this.audioProducer = null;
+    }
+    if (this.localStream) {
+      this.localStream.getTracks().forEach(track => track.stop());
+      this.localStream = null;
+    }
+    this.captureProfile = null;
+    this.updateAudioStatus('Off');
 
-      const stats = await peer.connection.getStats();
-      stats.forEach((report) => {
-        if (report.type !== 'outbound-rtp' || report.kind !== 'video') return;
+    this.stopStatsCollection();
+    this.updateStatsDisplay(null, null);
 
-        const previous = this.peerSnapshots.get(viewerId) || {
-          timestamp: report.timestamp,
-          bytesSent: report.bytesSent || 0,
-          framesEncoded: report.framesEncoded || 0
-        };
+    this.isBroadcasting = false;
+    this.viewers.clear();
+    this.updateViewersList();
+    logger.info('Stream stopped');
 
-        const elapsed = (report.timestamp - previous.timestamp) / 1000;
-        if (elapsed > 0) {
-          const bytesDelta = (report.bytesSent || 0) - previous.bytesSent;
-          const frameDelta = (report.framesEncoded || 0) - previous.framesEncoded;
-          if (bytesDelta >= 0) totalBitrateMbps += (bytesDelta * 8) / elapsed / 1000000;
-          if (frameDelta >= 0) fpsSamples.push(frameDelta / elapsed);
-        }
+    this.hideStreamPanel();
+    this.showCapturePanel();
+  }
 
-        this.peerSnapshots.set(viewerId, {
-          timestamp: report.timestamp,
-          bytesSent: report.bytesSent || 0,
-          framesEncoded: report.framesEncoded || 0
-        });
+  updateViewersList() {
+    const viewerCount = document.getElementById('viewerCount');
+    if (viewerCount) viewerCount.textContent = this.viewers.size;
+
+    const list = document.getElementById('viewersList');
+    if (list) {
+      list.innerHTML = '';
+      this.viewers.forEach((viewer, viewerId) => {
+        const item = document.createElement('div');
+        item.className = 'viewer-item';
+        item.innerHTML = '<span>' + viewer.name + ' (SFU)</span>';
+        list.appendChild(item);
       });
     }
+  }
 
-    const avgFps = fpsSamples.length > 0
-      ? fpsSamples.reduce((sum, v) => sum + v, 0) / fpsSamples.length
-      : null;
+  updateStreamStatus(status) {
+    const el = document.getElementById('streamStatus');
+    if (el) el.textContent = status;
+  }
 
-    // Log full outbound stats every 5 seconds
-    if (!this._diagStatsCounter) this._diagStatsCounter = 0;
-    this._diagStatsCounter++;
-    if (this._diagStatsCounter % 5 === 0) {
-      const peerSummaries = [];
-      for (const [vid, p] of this.peers.entries()) {
-        peerSummaries.push(p.name + ':L' + p.qualityLevel);
-      }
-      logger.info(
-        '[DIAG:OUTBOUND] bitrate=' + totalBitrateMbps.toFixed(2) + 'Mbps fps=' +
-        (avgFps != null ? Math.round(avgFps) : '--') +
-        ' peers=[' + peerSummaries.join(', ') + ']'
-      );
-    }
-
-    this.updateStatsDisplay(totalBitrateMbps, avgFps);
+  updateAudioStatus(status) {
+    const el = document.getElementById('audioStatus');
+    if (el) el.textContent = status;
   }
 
   updateStatsDisplay(bitrateMbps, fps) {
@@ -933,7 +784,7 @@ document.addEventListener('DOMContentLoaded', () => {
   logger.info('DOM loaded, initializing...');
   try {
     window.app = new StreamerApp();
-    logger.info('App ready');
+    logger.info('App ready (SFU mode)');
   } catch (err) {
     console.error('[INIT] Failed:', err);
     logger.error('Init failed: ' + err.message);

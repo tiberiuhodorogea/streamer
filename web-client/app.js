@@ -1,4 +1,4 @@
-﻿// ============================================
+// ============================================
 // SIGNALING CLIENT WITH AUTO-RECONNECT
 // ============================================
 class RawSignalClient {
@@ -12,6 +12,8 @@ class RawSignalClient {
     this._maxReconnectDelay = 15000;
     this._shouldReconnect = true;
     this._intentionalClose = false;
+    this._reqCounter = 0;
+    this._pendingRequests = new Map();
     this.connect();
   }
 
@@ -39,6 +41,21 @@ class RawSignalClient {
           const msg = JSON.parse(event.data);
           if (!Array.isArray(msg) || msg.length < 2) return;
           const [eventName, payload] = msg;
+
+          // Handle request/response pattern
+          if (eventName === 'response' && payload._reqId != null) {
+            const pending = this._pendingRequests.get(payload._reqId);
+            if (pending) {
+              this._pendingRequests.delete(payload._reqId);
+              if (payload.error) {
+                pending.reject(new Error(payload.error));
+              } else {
+                pending.resolve(payload);
+              }
+              return;
+            }
+          }
+
           this.fire(eventName, payload);
         } catch (error) {
           debugConsole.error('WebSocket parse error: ' + error.message);
@@ -50,6 +67,10 @@ class RawSignalClient {
       };
 
       this.ws.onclose = () => {
+        for (const [id, pending] of this._pendingRequests) {
+          pending.reject(new Error('Connection closed'));
+        }
+        this._pendingRequests.clear();
         this.fire('disconnect', 'socket closed');
         if (this._shouldReconnect && !this._intentionalClose) {
           this._scheduleReconnect();
@@ -93,9 +114,27 @@ class RawSignalClient {
     this.ws.send(JSON.stringify([eventName, payload || {}]));
   }
 
+  async request(eventName, data = {}) {
+    return new Promise((resolve, reject) => {
+      const reqId = ++this._reqCounter;
+      this._pendingRequests.set(reqId, { resolve, reject });
+      this.emit(eventName, { ...data, _reqId: reqId });
+      setTimeout(() => {
+        if (this._pendingRequests.has(reqId)) {
+          this._pendingRequests.delete(reqId);
+          reject(new Error('Request timeout: ' + eventName));
+        }
+      }, 15000);
+    });
+  }
+
   disconnect() {
     this._intentionalClose = true;
     this._shouldReconnect = false;
+    for (const [id, pending] of this._pendingRequests) {
+      pending.reject(new Error('Client closing'));
+    }
+    this._pendingRequests.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -160,21 +199,14 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 
 // ============================================
-// ICE SERVERS
-// ============================================
-const ICE_SERVERS = [
-  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-  { urls: ['stun:stun2.l.google.com:19302', 'stun:stun3.l.google.com:19302'] },
-  { urls: ['stun:stun4.l.google.com:19302'] }
-];
-
-// ============================================
-// VIEWER APP
+// VIEWER APP (SFU MODE)
 // ============================================
 class ViewerApp {
   constructor() {
     this.socket = null;
-    this.peerConnection = null;
+    this.device = null;           // mediasoup Device
+    this.recvTransport = null;    // mediasoup RecvTransport
+    this.consumers = new Map();   // consumerId -> mediasoup Consumer
     this.remoteStream = null;
     this.selectedStreamer = null;
     this.selectedStreamerName = '';
@@ -182,14 +214,13 @@ class ViewerApp {
     this.connectTimeout = null;
     this.audioMuted = true;
     this.statsOverlayVisible = false;
-    this.receiverSyncHintSeconds = 0.15;
     // Stats tracking
     this._prevBytesReceived = 0;
     this._prevFramesDecoded = 0;
     this._prevStatsTimestamp = 0;
 
     this.initializeUI();
-    debugConsole.info('Viewer app initialized');
+    debugConsole.info('Viewer app initialized (SFU mode)');
   }
 
   initializeUI() {
@@ -285,16 +316,37 @@ class ViewerApp {
       this.loadAvailableStreams();
     });
 
-    this.socket.on('offer', async (data) => {
-      debugConsole.info('Received WebRTC offer');
-      await this.handleOffer(data);
+    // SFU: after joining a streamer, we get router capabilities
+    this.socket.on('joined', async (data) => {
+      debugConsole.info('[SFU] Joined room — setting up consumer transport');
+      try {
+        await this.setupMediasoup(data.routerRtpCapabilities);
+        await this.startConsuming();
+      } catch (error) {
+        debugConsole.error('SFU setup failed: ' + error.message);
+        this.showError('Connection error: ' + error.message);
+      }
     });
 
-    this.socket.on('ice-candidate', (data) => {
-      const { candidate } = data;
-      if (this.peerConnection && candidate) {
-        this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
-          .catch(err => debugConsole.error('ICE candidate error: ' + err.message));
+    // Handle new producers added after we joined (e.g., audio added later)
+    this.socket.on('new-producer', async (data) => {
+      debugConsole.info('[SFU] New producer available: ' + data.kind);
+      if (this.recvTransport && this.device) {
+        try {
+          await this.consumeNewProducers();
+        } catch (error) {
+          debugConsole.error('Failed to consume new producer: ' + error.message);
+        }
+      }
+    });
+
+    // Handle consumer closed (producer stopped)
+    this.socket.on('consumer-closed', (data) => {
+      const consumer = this.consumers.get(data.consumerId);
+      if (consumer) {
+        consumer.close();
+        this.consumers.delete(data.consumerId);
+        debugConsole.info('[SFU] Consumer closed: ' + data.consumerId);
       }
     });
 
@@ -367,98 +419,129 @@ class ViewerApp {
     });
 
     this.hideStreamsPanel();
-    this.setupPeerConnection();
   }
 
-  setupPeerConnection() {
-    this.peerConnection = new RTCPeerConnection({
-      iceServers: ICE_SERVERS,
-      bundlePolicy: 'max-bundle',
-      sdpSemantics: 'unified-plan'
+  async setupMediasoup(routerRtpCapabilities) {
+    this.device = new mediasoupClient.Device();
+    await this.device.load({ routerRtpCapabilities });
+    debugConsole.info('[SFU] Device loaded with router capabilities');
+
+    // Create recv transport
+    const transportData = await this.socket.request('create-consumer-transport');
+
+    this.recvTransport = this.device.createRecvTransport({
+      id: transportData.id,
+      iceParameters: transportData.iceParameters,
+      iceCandidates: transportData.iceCandidates,
+      dtlsParameters: transportData.dtlsParameters,
     });
 
-    this.peerConnection.ontrack = (event) => {
-      debugConsole.info('Received track: ' + event.track.kind);
-      if (event.streams[0]) {
-        this.remoteStream = event.streams[0];
-        const video = document.getElementById('remoteVideo');
-        video.srcObject = this.remoteStream;
-        video.muted = this.audioMuted;
-        document.getElementById('connectionQuality').textContent = 'Live';
-        this.showPlayerPanel();
-        this.applyReceiverSyncPolicy();
-        this.startStatsCollection();
-        video.play().catch((err) => {
-          debugConsole.warn('Autoplay blocked: ' + err.message);
-        });
+    this.recvTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+      try {
+        await this.socket.request('connect-consumer-transport', { dtlsParameters });
+        callback();
+      } catch (error) {
+        errback(error);
       }
-    };
+    });
 
-    this.peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.socket.emit('ice-candidate', {
-          targetId: this.selectedStreamer,
-          candidate: event.candidate
-        });
-      }
-    };
-
-    this.peerConnection.onconnectionstatechange = () => {
-      if (!this.peerConnection) return;
-      const state = this.peerConnection.connectionState;
-      debugConsole.info('[DIAG:PEER] connectionState=' + state);
+    this.recvTransport.on('connectionstatechange', (state) => {
+      debugConsole.info('[SFU] Recv transport state: ' + state);
       document.getElementById('connectionQuality').textContent = state;
-      if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+      if (state === 'failed' || state === 'closed') {
         this.handleStreamerDisconnected();
       }
-    };
+    });
 
-    this.peerConnection.oniceconnectionstatechange = () => {
-      if (!this.peerConnection) return;
-      debugConsole.info('[DIAG:ICE] iceConnectionState=' + this.peerConnection.iceConnectionState);
-    };
-
-    this.peerConnection.onicegatheringstatechange = () => {
-      if (!this.peerConnection) return;
-      debugConsole.info('[DIAG:ICE] iceGatheringState=' + this.peerConnection.iceGatheringState);
-    };
+    debugConsole.info('[SFU] Recv transport created');
   }
 
-  async handleOffer(data) {
-    const { offer } = data;
-    if (!this.peerConnection) {
-      debugConsole.warn('Ignoring offer — no active peer connection');
-      return;
-    }
-    try {
-      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-      debugConsole.success('Remote description set');
-      this.applyReceiverSyncPolicy();
+  async startConsuming() {
+    const response = await this.socket.request('consume', {
+      rtpCapabilities: this.device.rtpCapabilities,
+    });
 
-      const answer = await this.peerConnection.createAnswer();
-      await this.peerConnection.setLocalDescription(answer);
-      debugConsole.success('Answer created');
+    this.remoteStream = new MediaStream();
 
-      this.socket.emit('answer', {
-        streamerId: this.selectedStreamer,
-        answer: answer
+    for (const consumerData of response.consumers) {
+      const consumer = await this.recvTransport.consume({
+        id: consumerData.id,
+        producerId: consumerData.producerId,
+        kind: consumerData.kind,
+        rtpParameters: consumerData.rtpParameters,
       });
-    } catch (error) {
-      debugConsole.error('Error handling offer: ' + error.message);
-      this.showError('Connection error: ' + error.message);
+
+      this.consumers.set(consumer.id, consumer);
+      this.remoteStream.addTrack(consumer.track);
+
+      // Resume consumer on the server (they start paused)
+      this.socket.emit('consumer-resume', { consumerId: consumer.id });
+
+      debugConsole.info('[SFU] Consuming ' + consumer.kind + ' (id: ' + consumer.id + ')');
+    }
+
+    const video = document.getElementById('remoteVideo');
+    video.srcObject = this.remoteStream;
+    video.muted = this.audioMuted;
+
+    document.getElementById('connectionQuality').textContent = 'Live';
+    this.showPlayerPanel();
+    this.startStatsCollection();
+
+    video.play().catch((err) => {
+      debugConsole.warn('Autoplay blocked: ' + err.message);
+    });
+
+    debugConsole.success('[SFU] Stream playing — receiving via SFU');
+  }
+
+  async consumeNewProducers() {
+    // Re-consume to pick up any new producers
+    const response = await this.socket.request('consume', {
+      rtpCapabilities: this.device.rtpCapabilities,
+    });
+
+    for (const consumerData of response.consumers) {
+      // Skip already-consumed producers
+      if (this.consumers.has(consumerData.id)) continue;
+
+      const consumer = await this.recvTransport.consume({
+        id: consumerData.id,
+        producerId: consumerData.producerId,
+        kind: consumerData.kind,
+        rtpParameters: consumerData.rtpParameters,
+      });
+
+      this.consumers.set(consumer.id, consumer);
+      if (this.remoteStream) {
+        this.remoteStream.addTrack(consumer.track);
+      }
+
+      this.socket.emit('consumer-resume', { consumerId: consumer.id });
+      debugConsole.info('[SFU] Consuming new ' + consumer.kind + ' (id: ' + consumer.id + ')');
     }
   }
 
   startStatsCollection() {
     if (this.statsInterval) clearInterval(this.statsInterval);
-    // Reset tracking
     this._prevBytesReceived = 0;
     this._prevFramesDecoded = 0;
     this._prevStatsTimestamp = 0;
 
     this.statsInterval = setInterval(async () => {
       try {
-        const stats = await this.peerConnection.getStats();
+        // Find the video consumer
+        let videoConsumer = null;
+        for (const consumer of this.consumers.values()) {
+          if (consumer.kind === 'video' && !consumer.closed) {
+            videoConsumer = consumer;
+            break;
+          }
+        }
+
+        if (!videoConsumer) return;
+
+        const stats = await videoConsumer.getStats();
         let inboundVideo = null;
 
         stats.forEach(report => {
@@ -536,7 +619,7 @@ class ViewerApp {
           }
         }
       } catch (error) {
-        debugConsole.error('Stats error: ' + error.message);
+        // Ignore transient stats errors
       }
     }, 1000);
   }
@@ -582,20 +665,6 @@ class ViewerApp {
     video.muted = this.audioMuted;
     button.textContent = this.audioMuted ? 'Unmute' : 'Mute';
     debugConsole.info(this.audioMuted ? 'Audio muted' : 'Audio unmuted');
-  }
-
-  applyReceiverSyncPolicy() {
-    if (!this.peerConnection) return;
-    this.peerConnection.getReceivers().forEach((receiver) => {
-      if (!receiver.track) return;
-      try {
-        if ('playoutDelayHint' in receiver) {
-          receiver.playoutDelayHint = this.receiverSyncHintSeconds;
-        }
-      } catch (error) {
-        debugConsole.warn('Sync hint unavailable for ' + receiver.track.kind);
-      }
-    });
   }
 
   async toggleFullscreen() {
@@ -646,14 +715,26 @@ class ViewerApp {
 
   removeConnection() {
     if (this.statsInterval) clearInterval(this.statsInterval);
-    if (this.peerConnection) {
-      this.peerConnection.close();
-      this.peerConnection = null;
+
+    // Close all consumers
+    for (const consumer of this.consumers.values()) {
+      consumer.close();
     }
+    this.consumers.clear();
+
+    // Close transport
+    if (this.recvTransport) {
+      this.recvTransport.close();
+      this.recvTransport = null;
+    }
+
+    this.device = null;
+
     if (this.remoteStream) {
       this.remoteStream.getTracks().forEach(track => track.stop());
       this.remoteStream = null;
     }
+
     const video = document.getElementById('remoteVideo');
     video.srcObject = null;
     video.muted = true;

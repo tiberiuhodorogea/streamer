@@ -1,10 +1,10 @@
-# P2P Streaming App
+# Lumina
 
 Low-latency peer-to-peer streaming stack for sharing games, apps, browser windows, or the entire desktop with friends.
 
 ## What It Does
 
-- Windows streamer app built with Electron
+- Windows Lumina App built with Electron
 - Browser-based viewer client for desktop and mobile
 - WebRTC peer-to-peer video delivery
 - Signaling server for discovery, offers, answers, and ICE relay
@@ -32,7 +32,7 @@ Low-latency peer-to-peer streaming stack for sharing games, apps, browser window
 ```
 streamer/
 ├── signaling-server/    # Node.js signaling service
-├── streamer-app/        # Electron streamer app (Windows)
+├── lumina-app/        # Lumina App (Windows)
 ├── web-client/          # Browser viewer
 ├── shared/              # Shared package/config
 ├── ARCHITECTURE.md
@@ -42,7 +42,7 @@ streamer/
 
 ## How It Works
 
-1. The streamer app connects to the signaling server and registers a stream.
+1. The Lumina App connects to the signaling server and registers a stream.
 2. A viewer opens the web client and discovers active streams.
 3. The signaling server relays WebRTC offers, answers, and ICE candidates.
 4. Video and optional source audio flow directly over WebRTC between streamer and viewer.
@@ -56,7 +56,7 @@ streamer/
 - Raw WebSocket signaling path used by the current app flow
 - Listens on port `4000`
 
-### `streamer-app`
+### `lumina-app`
 
 - Electron desktop app for Windows
 - Lets you:
@@ -79,7 +79,7 @@ streamer/
 ## Requirements
 
 - Node.js 18+
-- Windows for the Electron streamer app
+- Windows for the Lumina App
 - A modern Chromium-based browser is recommended for viewers
 
 ## Install
@@ -104,10 +104,10 @@ npm install --workspaces
 npm run start:signaling
 ```
 
-### Terminal 2: streamer app
+### Terminal 2: Lumina App
 
 ```bash
-npm run start:streamer
+npm run start:lumina
 ```
 
 ### Terminal 3: viewer web app
@@ -128,10 +128,10 @@ Use signaling URLs:
 
 ## Typical Usage
 
-### Streamer
+### Lumina Host
 
 1. Launch the signaling server.
-2. Launch the Electron streamer app.
+2. Launch the Lumina App.
 3. Enter the signaling URL.
 4. Enter a stream name.
 5. Pick a streaming profile.
@@ -149,7 +149,7 @@ Use signaling URLs:
 
 ## Streaming Profiles
 
-The streamer app includes four presets.
+The Lumina App includes four presets.
 
 - `Smooth FPS`
 	- prioritizes responsiveness and lower decode cost
@@ -192,7 +192,7 @@ Top-level scripts:
 
 ```bash
 npm run start:signaling
-npm run start:streamer
+npm run start:lumina
 npm run start:web
 ```
 

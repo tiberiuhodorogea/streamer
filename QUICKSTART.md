@@ -1,11 +1,11 @@
-# P2P Streaming Application - Quick Start Guide
+# Luminalication - Quick Start Guide
 
 ## Project Structure
 
 ```
 streamer/
 ├── signaling-server/    # WebRTC signaling server (Node.js + Socket.io)
-├── streamer-app/        # Electron app (Windows) - screen capture & streaming
+├── lumina-app/        # Electron app (Windows) - screen capture & streaming
 ├── web-client/          # Web viewer (vanilla JS + WebRTC)
 └── shared/              # Shared config and utilities
 ```
@@ -15,7 +15,7 @@ streamer/
 ## Prerequisites
 
 - **Node.js 18+**: [Download](https://nodejs.org/)
-- **Windows 11**: For the Electron streamer app
+- **Windows 11**: For the Lumina App
 - **NVIDIA GPU**: Optional but recommended for hardware encoding (5090 RTX in your case)
 - **Browser**: Modern Chrome/Edge/Firefox for viewing
 
@@ -68,9 +68,9 @@ npm start
 ```
 ✓ Server runs on `ws://localhost:4000`
 
-**Terminal 2 - Streamer App (Windows only):**
+**Terminal 2 - Lumina App (Windows only):**
 ```bash
-cd streamer-app
+cd lumina-app
 npm start
 ```
 ✓ Electron window opens. Connect to server and select screen to stream.
@@ -92,7 +92,7 @@ npm start
    - Relays WebRTC connection details (SDP, ICE candidates)
    - Written in: Node.js + Express + Socket.io
 
-### 2. **Streamer App** (Electron)
+### 2. **Lumina App** (Electron)
    - Runs on your Windows machine
    - Captures screen/window content
    - Encodes with H.264 (NVENC-accelerated on your RTX 5090)
@@ -116,7 +116,7 @@ npm start
 
 1. **Start all three components** (see "Running the Application")
 
-2. **On Streamer App (Windows):**
+2. **On Lumina App (Windows):**
    - Enter server URL: `ws://localhost:4000`
    - Enter streamer name (e.g., "Gaming Stream")
    - Click "Connect to Server"
@@ -225,7 +225,7 @@ Each component is designed to be independently operated:
 
 ### Cloud Deployment Option 1: Signaling Server
 ```
-Streamer App (Windows, local) 
+Lumina App (Windows, local) 
     ↓
     Signaling Server (AWS EC2 / DigitalOcean)
     ↑
@@ -234,12 +234,12 @@ Web Client (Browser, shared URL)
 
 **Steps:**
 1. Deploy `signaling-server` to VPS
-2. Update URL in Streamer App and Web Client to point to remote server
+2. Update URL in Lumina App and Web Client to point to remote server
 3. No other changes needed!
 
 ### Cloud Deployment Option 2: Web Client
 ```
-Streamer App (Windows, local)
+Lumina App (Windows, local)
     ↓
     Signaling Server (AWS EC2)
     ↑
@@ -261,17 +261,17 @@ Web Client (CloudFront / S3 static hosting)
 **Example: Add chat functionality**
 1. Update signaling server to relay chat messages via Socket.io
 2. Add chat UI to web-client
-3. Trigger chat events from streamer-app
+3. Trigger chat events from lumina-app
 
 **Example: Add multiple streams**
 1. Modify signaling server to support stream IDs
-2. Update Streamer App to handle multiple streams
+2. Update Lumina App to handle multiple streams
 3. Update Web Client to display stream thumbnails
 
 ### Debugging
 
 - **Signaling Server**: Check console output
-- **Streamer App**: Open DevTools with `Ctrl+Shift+I`
+- **Lumina App**: Open DevTools with `Ctrl+Shift+I`
 - **Web Client**: Open browser DevTools with `F12`
 
 ---

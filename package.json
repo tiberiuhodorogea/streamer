@@ -1,11 +1,11 @@
 {
-  "name": "p2p-streaming-poc",
+  "name": "lumina",
   "version": "0.1.0",
-  "description": "Fast P2P streaming application - POC",
+  "description": "Lumina - Fast P2P streaming application",
   "private": true,
   "workspaces": [
     "signaling-server",
-    "streamer-app",
+    "lumina-app",
     "web-client",
     "shared"
   ],
@@ -13,9 +13,9 @@
     "install": "npm install --workspaces",
     "dev": "npm run dev --workspaces",
     "build": "npm run build --workspaces",
-    "build:mediasoup-client": "npx esbuild --bundle --format=iife --global-name=mediasoupClient --platform=browser --minify mediasoup-client --outfile=web-client/mediasoup-client.min.js && node -e \"require('fs').copyFileSync('web-client/mediasoup-client.min.js','streamer-app/src/ui/mediasoup-client.min.js')\"",
+    "build:mediasoup-client": "npx esbuild --bundle --format=iife --global-name=mediasoupClient --platform=browser --minify mediasoup-client --outfile=web-client/mediasoup-client.min.js && node -e \"require('fs').copyFileSync('web-client/mediasoup-client.min.js','lumina-app/src/ui/mediasoup-client.min.js')\"",
     "start:signaling": "npm start --workspace=signaling-server",
-    "start:streamer": "npm start --workspace=streamer-app",
+    "start:lumina": "npm start --workspace=lumina-app",
     "start:web": "npm start --workspace=web-client"
   },
   "keywords": [

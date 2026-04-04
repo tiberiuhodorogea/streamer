@@ -1,7 +1,7 @@
 {
-  "name": "streamer-app",
+  "name": "lumina-app",
   "version": "0.1.0",
-  "description": "Electron streamer application",
+  "description": "Lumina - Electron streaming application",
   "main": "src/main.cjs",
   "scripts": {
     "start": "electron .",

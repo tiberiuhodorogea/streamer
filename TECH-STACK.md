@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**P2P Streaming Application** - Minimal, modern, production-ready proof of concept.
+**Luminalication** - Minimal, modern, production-ready proof of concept.
 
 Built with a microservices-inspired architecture:
 - **Signaling Service**: WebSocket-based connection brokering
@@ -35,7 +35,7 @@ Root (npm workspaces)
 │  ├─ socket.io@4.6.2 (WebSocket & real-time events)
 │  └─ cors@2.8.5 (Cross-origin resource sharing)
 │
-├─ streamer-app/
+├─ lumina-app/
 │  ├─ electron@27.0.0 (Desktop application framework)
 │  ├─ simple-peer@9.11.1 (WebRTC wrapper, connection management)
 │  └─ socket.io-client@4.6.2 (Client-side WebSocket)
@@ -99,7 +99,7 @@ app.use(cors());
 
 ---
 
-### streamer-app
+### lumina-app
 
 #### electron@27.0.0
 ```javascript
@@ -200,7 +200,7 @@ npm start  # Runs: http-server -p 3000 -o
 {
   "workspaces": [
     "signaling-server",
-    "streamer-app", 
+    "lumina-app", 
     "web-client",
     "shared"
   ]
@@ -239,7 +239,7 @@ npm start  # Runs: http-server -p 3000 -o
 - Deploy as-is to Node.js 18+ runtime
 - Alternatively: Bundle with esbuild for smaller deploy
 
-### Streamer App
+### Lumina App
 - Electron handles bundling automatically
 - Can create `.exe` with `electron-builder` package
 - Optional: Code signing for Windows Defender

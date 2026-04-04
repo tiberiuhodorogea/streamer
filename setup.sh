@@ -1,10 +1,10 @@
 #!/bin/bash
-# P2P Streaming - Multi-Component Setup Script
+# Lumina - Setup Script
 # This script installs dependencies for all components
 
 echo ""
 echo "╔════════════════════════════════════════════════════════╗"
-echo "║  P2P Streaming Application - Setup                     ║"
+echo "║  Lumina - Setup                                         ║"
 echo "║  Installing dependencies for all components             ║"
 echo "╚════════════════════════════════════════════════════════╝"
 echo ""
@@ -52,8 +52,8 @@ echo "2. Terminal 1 - Start Signaling Server:"
 echo "   cd signaling-server"
 echo "   npm start"
 echo ""
-echo "3. Terminal 2 - Start Electron Streamer App:"
-echo "   cd streamer-app"
+echo "3. Terminal 2 - Start Lumina App:"
+echo "   cd lumina-app"
 echo "   npm start"
 echo ""
 echo "4. Terminal 3 - Start Web Viewer:"

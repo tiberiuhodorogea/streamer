@@ -245,8 +245,8 @@ const DEGRADATION_TIERS = [
 // Degrades fast (2s cooldown), recovers aggressively (3s of good health).
 // ============================================
 class AdaptiveQualityController {
-  constructor(streamerApp) {
-    this.app = streamerApp;
+  constructor(luminaApp) {
+    this.app = luminaApp;
     this.enabled = true;
     this.tierIndex = 0;               // current tier (0 = max quality)
     this.profileMaxBitrate = 0;
@@ -653,9 +653,9 @@ class AdaptiveQualityController {
 }
 
 // ============================================
-// STREAMER APP (SFU MODE)
+// LUMINA APP (SFU MODE)
 // ============================================
-class StreamerApp {
+class LuminaApp {
   constructor() {
     try {
       this.socket = null;
@@ -668,7 +668,7 @@ class StreamerApp {
       this.selectedProfileKey = 'quality';
       this.includeAudio = true;
       this.isBroadcasting = false;
-      this.streamerName = '';
+      this.luminaName = '';
       this.serverUrl = '';
       this.statsInterval = null;
       this.viewers = new Map();    // viewerId -> { name }
@@ -684,7 +684,7 @@ class StreamerApp {
       this.abr = new AdaptiveQualityController(this);
       this._bitrateCapMbps = null; // null = use profile default
 
-      logger.info('StreamerApp initializing (SFU mode)...');
+      logger.info('LuminaApp initializing (SFU mode)...');
       this.attachEventListeners();
       logger.info('Event listeners attached');
     } catch (err) {
@@ -806,20 +806,20 @@ class StreamerApp {
 
   async connect() {
     const serverUrlInput = document.getElementById('serverUrl');
-    const streamerNameInput = document.getElementById('streamerName');
+    const streamNameInput = document.getElementById('streamName');
 
-    if (!serverUrlInput || !streamerNameInput) {
+    if (!serverUrlInput || !streamNameInput) {
       logger.error('Input elements not found');
       return;
     }
 
     const serverUrl = serverUrlInput.value.trim();
-    const streamerName = streamerNameInput.value.trim();
-    this.streamerName = streamerName;
+    const streamName = streamNameInput.value.trim();
+    this.luminaName = streamName;
     this.serverUrl = serverUrl;
 
-    if (!serverUrl || !streamerName) {
-      logger.error('Missing server URL or streamer name');
+    if (!serverUrl || !streamName) {
+      logger.error('Missing server URL or stream name');
       alert('Please fill in all fields');
       return;
     }
@@ -830,7 +830,7 @@ class StreamerApp {
     }
 
     this.setStatus('Connecting...', 'blue');
-    logger.info('Connecting to ' + serverUrl + ' as "' + streamerName + '"');
+    logger.info('Connecting to ' + serverUrl + ' as "' + streamName + '"');
 
     this.socket = new SignalClient(serverUrl, {
       reconnection: true,
@@ -842,11 +842,11 @@ class StreamerApp {
     this.socket.on('connect', () => {
       logger.info('CONNECTED TO SERVER');
       this.setStatus('Connected', 'green');
-      this.socket.emit('register-streamer', { name: streamerName });
+      this.socket.emit('register-streamer', { name: streamName });
     });
 
     this.socket.on('registered', async (data) => {
-      logger.info('Registered as streamer — setting up SFU transport');
+      logger.info('Registered as Lumina host — setting up SFU transport');
       try {
         await this.setupMediasoup(data.routerRtpCapabilities);
         this.showCapturePanel();
@@ -1751,7 +1751,7 @@ class StreamerApp {
 document.addEventListener('DOMContentLoaded', () => {
   logger.info('DOM loaded, initializing...');
   try {
-    window.app = new StreamerApp();
+    window.app = new LuminaApp();
     logger.info('App ready (SFU mode)');
   } catch (err) {
     console.error('[INIT] Failed:', err);
@@ -1762,7 +1762,7 @@ document.addEventListener('DOMContentLoaded', () => {
 if (document.readyState !== 'loading' && !window.app) {
   setTimeout(() => {
     if (!window.app) {
-      window.app = new StreamerApp();
+      window.app = new LuminaApp();
       logger.info('App created (late init)');
     }
   }, 100);

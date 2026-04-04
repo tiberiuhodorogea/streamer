@@ -26,7 +26,7 @@ export const config = {
   },
 
   // Performance
-  maxViewersPerStreamer: 10,
+  maxViewersPerHost: 10,
   maxBitrate: 15000000, // 15 Mbps
   minBitrate: 2000000,  // 2 Mbps
 

@@ -1,10 +1,10 @@
 #!/bin/bash
-# P2P Streaming - Quick Start All Components
+# Lumina - Quick Start All Components
 # Opens terminals and starts all services
 
 echo ""
 echo "╔════════════════════════════════════════════════════════╗"
-echo "║  P2P Streaming - Starting All Components               ║"
+echo "║  Lumina - Starting All Components                       ║"
 echo "╚════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -16,12 +16,12 @@ xterm -e "cd signaling-server && npm start" 2>/dev/null || \
 SIGNAL_PID=$!
 sleep 2
 
-# Start Streamer App
-echo "Starting Electron Streamer App..."
-gnome-terminal -- bash -c "cd streamer-app && npm start; bash" 2>/dev/null || \
-xterm -e "cd streamer-app && npm start" 2>/dev/null || \
-(cd streamer-app && npm start) &
-STREAMER_PID=$!
+# Start Lumina App
+echo "Starting Lumina App..."
+gnome-terminal -- bash -c "cd lumina-app && npm start; bash" 2>/dev/null || \
+xterm -e "cd lumina-app && npm start" 2>/dev/null || \
+(cd lumina-app && npm start) &
+LUMINA_PID=$!
 sleep 2
 
 # Start Web Client
@@ -36,6 +36,6 @@ echo "✓ All components started!"
 echo ""
 echo "Components running:"
 echo "  • Signaling Server: ws://localhost:4000"
-echo "  • Streamer App: Electron window"
+echo "  • Lumina: Electron window"
 echo "  • Web Client: http://localhost:3000"
 echo ""

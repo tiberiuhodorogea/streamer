@@ -40,7 +40,7 @@ const sessionStats = {
   totalViewerJoins: 0,
   totalViewerLeaves: 0,
   totalQualityReports: 0,
-  totalStreamerRegistrations: 0,
+  totalLuminaRegistrations: 0,
   peakViewerCount: 0,
   qualityReportSamples: [],   // last N for summary
   abrEvents: [],               // ABR tier changes
@@ -252,7 +252,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.get('/streamers', (req, res) => {
+app.get('/lumina', (req, res) => {
   const list = Array.from(rooms.entries()).map(([id, room]) => ({
     id,
     name: room.streamer.name || id,
@@ -323,7 +323,7 @@ function handleMessage(clientId, msg, ws) {
 
   switch (eventName) {
     case 'register-streamer':
-      return handleStreamerRegister(clientId, eventData, ws);
+      return handleLuminaRegister(clientId, eventData, ws);
     case 'create-producer-transport':
       return handleCreateProducerTransport(clientId, eventData);
     case 'connect-producer-transport':
@@ -348,12 +348,12 @@ function handleMessage(clientId, msg, ws) {
 }
 
 // ============================================
-// STREAMER HANDLERS
+// LUMINA HANDLERS
 // ============================================
 
-async function handleStreamerRegister(clientId, data, ws) {
+async function handleLuminaRegister(clientId, data, ws) {
   const name = String(data?.name || clientId).substring(0, 64);
-  console.log('[SFU] Registering streamer: ' + name);
+  console.log('[SFU] Registering Lumina host: ' + name);
 
   try {
     const router = await worker.createRouter({ mediaCodecs: MEDIA_CODECS });
@@ -371,11 +371,11 @@ async function handleStreamerRegister(clientId, data, ws) {
     });
 
     const client = clients.get(clientId);
-    client.role = 'streamer';
+    client.role = 'lumina';
     client.roomId = clientId;
 
-    sessionStats.totalStreamerRegistrations++;
-    appendSessionLog('streamer-registered', { clientId, name });
+    sessionStats.totalLuminaRegistrations++;
+    appendSessionLog('lumina-registered', { clientId, name });
 
     send(ws, 'registered', {
       routerRtpCapabilities: router.rtpCapabilities,
@@ -483,7 +483,7 @@ async function handleViewerJoin(clientId, data, ws) {
   const room = rooms.get(streamerId);
 
   if (!room) {
-    send(ws, 'error', { message: 'Streamer not found' });
+    send(ws, 'error', { message: 'Host not found' });
     return;
   }
 
@@ -907,18 +907,18 @@ function handleDisconnect(clientId) {
   const client = clients.get(clientId);
   if (!client) return;
 
-  if (client.role === 'streamer') {
+  if (client.role === 'lumina') {
     const room = rooms.get(clientId);
     if (room) {
       stopBwePolling(clientId);
-      appendSessionLog('streamer-disconnected', { clientId, name: room.streamer.name });
+      appendSessionLog('lumina-disconnected', { clientId, name: room.streamer.name });
       for (const [viewerId, viewer] of room.viewers) {
         send(viewer.ws, 'streamer-disconnected', {});
         if (viewer.consumerTransport) viewer.consumerTransport.close();
       }
       room.router.close();
       rooms.delete(clientId);
-      console.log('[SFU] Room closed for streamer ' + room.streamer.name);
+      console.log('[SFU] Room closed for Lumina host ' + room.streamer.name);
     }
 
     for (const [cid, c] of clients) {
@@ -975,12 +975,12 @@ async function start() {
 
   server.listen(config.PORT, config.HOST, () => {
     console.log('');
-    console.log('  P2P Streaming SFU Server (mediasoup)');
+    console.log('  Lumina SFU Server (mediasoup)');
     console.log('  Ready for connections');
     console.log('');
     console.log('  WebSocket:    ws://' + config.HOST + ':' + config.PORT + '/ws');
     console.log('  Health:       http://' + config.HOST + ':' + config.PORT + '/health');
-    console.log('  Streamers:    http://' + config.HOST + ':' + config.PORT + '/streamers');
+    console.log('  Hosts:        http://' + config.HOST + ':' + config.PORT + '/lumina');
     console.log('  Announced IP: ' + announcedIp);
     console.log('  RTP ports:    ' + config.RTC_MIN_PORT + '-' + config.RTC_MAX_PORT);
     console.log('');

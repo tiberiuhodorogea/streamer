@@ -6,8 +6,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 let mainWindow;
-let streamerSocket = null;
-const SHOULD_OPEN_DEVTOOLS = process.env.STREAMER_DEVTOOLS === '1';
+let luminaSocket = null;
+const SHOULD_OPEN_DEVTOOLS = process.env.LUMINA_DEVTOOLS === '1';
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({

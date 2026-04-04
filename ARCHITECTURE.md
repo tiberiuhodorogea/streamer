@@ -8,7 +8,7 @@
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                   │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Streamer App (Electron)                                 │  │
+│  │  Lumina App (Electron)                                 │  │
 │  ├──────────────────────────────────────────────────────────┤  │
 │  │  • Desktop Capture (1920×1080 @ 60fps)                   │  │
 │  │  • H.264 Encoder (NVENC accelerated)                     │  │
@@ -46,7 +46,7 @@
 ### 1. **Initialization**
 
 ```
-Streamer App
+Lumina App
     ↓ (register-streamer)
 Signaling Server → broadcasts (streamer-joined)
                    ↓
@@ -120,7 +120,7 @@ HTML5 Video Element (VP9/H.264)
 
 **Endpoints**:
 - `GET /health`: Server health check
-- `GET /streamers`: List active streamers
+- `GET /lumina`: List active streamers
 - WebSocket: `ws://localhost:4000`
 
 **Scalability**:
@@ -130,7 +130,7 @@ HTML5 Video Element (VP9/H.264)
 
 ---
 
-### Streamer App (`streamer-app/`)
+### Lumina App (`lumina-app/`)
 
 **Purpose**: Capture screen and stream to multiple peers
 
@@ -224,7 +224,7 @@ const { host, port } = config.signaling;
 
 ## Data Structures
 
-### Streamer Registration (Socket.io)
+### Lumina Host Registration (Socket.io)
 
 ```javascript
 // Streamer sends
@@ -367,7 +367,7 @@ After:
 
 **Steps**:
 1. Deploy `signaling-server` to AWS EC2 (t3.small sufficient)
-2. Update URL in Streamer app: `ws://your-aws-domain:4000`
+2. Update URL in Lumina App: `ws://your-aws-domain:4000`
 3. Update URL in Web Client: point to same domain
 4. Done! Streamers and viewers find each other via cloud
 
@@ -421,7 +421,7 @@ All on AWS:
 
 ## Performance Optimization
 
-### On the Streamer App
+### On the Lumina App
 
 1. **Use NVENC**: Automatic, just ensure GPU drivers updated
 2. **Select specific app window**: Reduces CPU overhead vs full desktop

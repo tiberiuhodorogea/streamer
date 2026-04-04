@@ -29,8 +29,8 @@ npm install --workspaces
 # Terminal 1: Signaling Server (ws://localhost:4000)
 cd signaling-server && npm start
 
-# Terminal 2: Streamer App (Electron, Windows only)
-cd streamer-app && npm start
+# Terminal 2: Lumina App (Electron, Windows only)
+cd lumina-app && npm start
 
 # Terminal 3: Web Viewer (http://localhost:3000)
 cd web-client && npm start
@@ -46,7 +46,7 @@ cd web-client && npm start
 │  ├─ src/index.js        Main server
 │  └─ package.json
 │
-├─ streamer-app/          Desktop streamer app (Electron)
+├─ lumina-app/          Desktop Lumina App (Electron)
 │  ├─ src/main.js         Electron main process
 │  ├─ src/preload.js      Security layer
 │  ├─ src/ui/
@@ -82,11 +82,11 @@ cd web-client && npm start
 ### I want to modify the video quality
 1. Edit `shared/config.js`
 2. Adjust `video.width`, `video.height`, `video.frameRate`
-3. Restart streamer app
+3. Restart Lumina App
 
 ### I want to stream to friends on the internet
 1. Deploy `signaling-server` to AWS EC2 / DigitalOcean / Heroku
-2. Update server URL in both `streamer-app` and `web-client`
+2. Update server URL in both `lumina-app` and `web-client`
 3. Give friends the web client URL
 4. See [ARCHITECTURE.md](./ARCHITECTURE.md) → Cloud Migration Paths
 
@@ -153,13 +153,13 @@ cd web-client && npm start
 ### Black screen on web viewer
 **Cause**: WebRTC connection not established
 **Check**:
-- Streamer app is connected and streaming
+- Lumina App is connected and streaming
 - Browser developer console (F12) for errors
 - Network tab to see if WebSocket connects
 
 ### Streams not appearing in viewer
 **Cause**: Streamer hasn't connected yet
-**Fix**: Make sure streamer app says "Connected" (green badge)
+**Fix**: Make sure Lumina App says "Connected" (green badge)
 
 ### Viewers can't join from different WiFi
 **Cause**: NAT/Firewall blocking P2P connections
@@ -228,11 +228,11 @@ DEBUG=* npm start  # Shows all Socket.io events
 
 ### Entry Points
 - `signaling-server/src/index.js` - Start server here
-- `streamer-app/src/main.js` - Start app here
+- `lumina-app/src/main.js` - Start app here
 - `web-client/index.html` - Open in browser
 
 ### UI Files
-- `streamer-app/src/ui/` - Electron UI components
+- `lumina-app/src/ui/` - Electron UI components
 - `web-client/` - Web viewer UI
 
 ---

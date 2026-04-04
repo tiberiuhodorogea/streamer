@@ -1,10 +1,10 @@
 @echo off
-REM P2P Streaming - Quick Start All Components
+REM Lumina - Quick Start All Components
 REM Opens 3 separate terminal windows and starts all services
 
 echo.
 echo ╔════════════════════════════════════════════════════════╗
-echo ║  P2P Streaming - Starting All Components               ║
+echo ║  Lumina - Starting All Components                       ║
 echo ╚════════════════════════════════════════════════════════╝
 echo.
 
@@ -13,9 +13,9 @@ echo Starting Signaling Server on ws://localhost:4000...
 start "Signaling Server" cmd /k "cd signaling-server && npm start"
 timeout /t 2 /nobreak
 
-REM Start Streamer App in new window
-echo Starting Electron Streamer App...
-start "Streamer App" cmd /k "cd streamer-app && npm start"
+REM Start Lumina App in new window
+echo Starting Lumina App...
+start "Lumina" cmd /k "cd lumina-app && npm start"
 timeout /t 2 /nobreak
 
 REM Start Web Client in new window

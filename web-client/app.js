@@ -208,8 +208,8 @@ class ViewerApp {
     this.recvTransport = null;    // mediasoup RecvTransport
     this.consumers = new Map();   // consumerId -> mediasoup Consumer
     this.remoteStream = null;
-    this.selectedStreamer = null;
-    this.selectedStreamerName = '';
+    this.selectedLumina = null;
+    this.selectedLuminaName = '';
     this.statsInterval = null;
     this.connectTimeout = null;
     this.audioMuted = true;
@@ -351,8 +351,8 @@ class ViewerApp {
     });
 
     this.socket.on('streamer-left', (data) => {
-      if (this.selectedStreamer === data.streamerId) {
-        this.handleStreamerDisconnected();
+      if (this.selectedLumina === data.streamerId) {
+        this.handleLuminaDisconnected();
       }
       this.loadAvailableStreams();
     });
@@ -397,8 +397,8 @@ class ViewerApp {
     });
 
     this.socket.on('streamer-disconnected', () => {
-      debugConsole.warn('Streamer disconnected');
-      this.handleStreamerDisconnected();
+      debugConsole.warn('Lumina disconnected');
+      this.handleLuminaDisconnected();
     });
 
     this.socket.on('disconnect', (reason) => {
@@ -414,11 +414,11 @@ class ViewerApp {
 
   async loadAvailableStreams() {
     try {
-      const streamsUrl = this.getHttpUrl() + '/streamers';
+      const streamsUrl = this.getHttpUrl() + '/lumina';
       debugConsole.info('Loading streams from ' + streamsUrl);
       const response = await fetch(streamsUrl);
       const streamers = await response.json();
-      debugConsole.success('Loaded ' + streamers.length + ' streamer(s)');
+      debugConsole.success('Loaded ' + streamers.length + ' host(s)');
 
       const list = document.getElementById('streamsList');
       list.innerHTML = '';
@@ -439,7 +439,7 @@ class ViewerApp {
             '<button class="btn btn-primary btn-small">Watch Stream</button>' +
           '</div>';
         item.querySelector('button').addEventListener('click', () => {
-          this.joinStreamer(streamer);
+          this.joinLumina(streamer);
         });
         list.appendChild(item);
       });
@@ -451,14 +451,14 @@ class ViewerApp {
     }
   }
 
-  joinStreamer(streamer) {
-    if (this.selectedStreamer) {
+  joinLumina(streamer) {
+    if (this.selectedLumina) {
       this.removeConnection();
     }
     debugConsole.info('Joining ' + (streamer.name || streamer.id));
-    this.selectedStreamer = streamer.id;
-    this.selectedStreamerName = streamer.name || streamer.id;
-    document.getElementById('streamTitle').textContent = this.selectedStreamerName;
+    this.selectedLumina = streamer.id;
+    this.selectedLuminaName = streamer.name || streamer.id;
+    document.getElementById('streamTitle').textContent = this.selectedLuminaName;
     document.getElementById('connectionQuality').textContent = 'Connecting';
     const viewerName = document.getElementById('viewerName').value;
 
@@ -502,7 +502,7 @@ class ViewerApp {
       debugConsole.info('[SFU] Recv transport state: ' + state);
       document.getElementById('connectionQuality').textContent = state;
       if (state === 'failed' || state === 'closed') {
-        this.handleStreamerDisconnected();
+        this.handleLuminaDisconnected();
       }
     });
 
@@ -660,7 +660,7 @@ class ViewerApp {
           document.getElementById('overlayJitter').textContent = (jitterMs != null ? jitterMs + ' ms' : '-- ms');
         }
 
-        if (fps !== null && this.socket && this.selectedStreamer) {
+        if (fps !== null && this.socket && this.selectedLumina) {
           const lossRate = intervalLossRate != null ? intervalLossRate : 0;
 
           // Suppress stale reports — if 3+ consecutive fps=0, stop flooding the server
@@ -672,7 +672,7 @@ class ViewerApp {
           }
 
           this.socket.emit('viewer-quality-report', {
-            streamerId: this.selectedStreamer,
+            streamerId: this.selectedLumina,
             fps, bitrateMbps, frameWidth, frameHeight, jitterMs,
             lossRate: Number(lossRate.toFixed(4)),
           });
@@ -697,13 +697,13 @@ class ViewerApp {
     }, 1000);
   }
 
-  async handleStreamerDisconnected() {
+  async handleLuminaDisconnected() {
     this.removeConnection();
     await this.exitFullscreenIfNeeded();
     this.hidePlayerPanel();
     this.showStreamsPanel();
     document.getElementById('connectionQuality').textContent = '';
-    this.showError('Streamer disconnected');
+    this.showError('Lumina disconnected');
   }
 
   async disconnect() {

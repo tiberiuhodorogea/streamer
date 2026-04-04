@@ -10,8 +10,8 @@ app.commandLine.appendSwitch('enable-features',
   'WebRtcAllowWgcWindowCapturer,WebRtcAllowWgcScreenCapturer');
 
 let mainWindow;
-const APP_CAPTURE_NAMES = new Set(['Streamer Studio', 'P2P Stream - Streamer']);
-const SHOULD_OPEN_DEVTOOLS = process.env.STREAMER_DEVTOOLS === '1';
+const APP_CAPTURE_NAMES = new Set(['Lumina Studio', 'Lumina']);
+const SHOULD_OPEN_DEVTOOLS = process.env.LUMINA_DEVTOOLS === '1';
 
 // ========== SESSION LOGGING (writes to same session dir as signaling server) ==========
 const repoRoot = path.resolve(__dirname, '..', '..');
@@ -23,7 +23,7 @@ try {
 } catch {}
 
 // Find the latest session directory created by the signaling server, or create our own
-let streamerSessionDir;
+let luminaSessionDir;
 const sessionsRoot = path.join(repoRoot, 'logs', 'sessions');
 try {
   const dirs = fs.readdirSync(sessionsRoot)
@@ -38,21 +38,21 @@ try {
     return (Date.now() - mtime) < 60000;
   });
   if (recent) {
-    streamerSessionDir = path.join(sessionsRoot, recent);
+    luminaSessionDir = path.join(sessionsRoot, recent);
   }
 } catch {}
 
-if (!streamerSessionDir) {
-  streamerSessionDir = path.join(sessionsRoot, `${sessionId}-${gitCommit}`);
-  fs.mkdirSync(streamerSessionDir, { recursive: true });
+if (!luminaSessionDir) {
+  luminaSessionDir = path.join(sessionsRoot, `${sessionId}-${gitCommit}`);
+  fs.mkdirSync(luminaSessionDir, { recursive: true });
 }
 
-const streamerLogPath = path.join(streamerSessionDir, 'streamer.jsonl');
-console.log('[SESSION] Streamer logging to ' + streamerLogPath);
+const luminaLogPath = path.join(luminaSessionDir, 'lumina.jsonl');
+console.log('[SESSION] Lumina logging to ' + luminaLogPath);
 
-function appendStreamerLog(type, payload) {
+function appendLuminaLog(type, payload) {
   try {
-    fs.appendFileSync(streamerLogPath, JSON.stringify({
+    fs.appendFileSync(luminaLogPath, JSON.stringify({
       ts: new Date().toISOString(),
       type,
       payload,
@@ -60,7 +60,7 @@ function appendStreamerLog(type, payload) {
   } catch {}
 }
 
-appendStreamerLog('streamer-started', {
+appendLuminaLog('lumina-started', {
   gitCommit,
   electronVersion: process.versions.electron,
   chromeVersion: process.versions.chrome,
@@ -197,12 +197,12 @@ app.on('window-all-closed', () => {
 
 // IPC Handler: Write a structured log entry to the session JSONL file
 ipcMain.handle('session-log', async (_event, { type, payload }) => {
-  appendStreamerLog(type, payload);
+  appendLuminaLog(type, payload);
 });
 
 // IPC Handler: Get the session directory path
 ipcMain.handle('get-session-dir', async () => {
-  return streamerSessionDir;
+  return luminaSessionDir;
 });
 
 // IPC Handler: Get available screens and windows for capture

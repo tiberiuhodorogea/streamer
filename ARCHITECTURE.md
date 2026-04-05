@@ -124,9 +124,9 @@ This file holds shared defaults for signaling host/port, video defaults, bitrate
 
 ### 4. Adaptive quality loop
 
-1. The viewer gathers playback stats such as bitrate, FPS, jitter, and loss.
-2. The server polls mediasoup stats like RTT, NACK rate, score, and available bitrate.
-3. The streamer combines those signals and steps quality tiers up or down.
+1. The viewer gathers playback stats such as bitrate, FPS, jitter, loss, dropped-frame deltas, and decode or jitter-buffer delay.
+2. The server polls mediasoup stats like RTT, NACK rate, score, delivery bitrate, and per-viewer bottleneck spread.
+3. The streamer runs a single smoothness-first controller that aims for 1080p60 when healthy, degrades bitrate and resolution before frame rate, and weighs multi-viewer fairness before reacting to one weak viewer.
 
 ## Logging
 
@@ -134,6 +134,8 @@ Runtime artifacts are stored under `logs/`.
 
 - `logs/sessions/`: per-run JSON and JSONL outputs from signaling and streamer processes
 - `logs/baselines/`: analysis snapshots used for comparison work
+
+Streaming changes are expected to preserve and extend telemetry. The current tuning workflow relies on raw JSONL events, session summaries, bottleneck-viewer transitions, encoder or source-stall events, and ABR decision logs to validate any change in adaptation behavior.
 
 These logs are operational artifacts. They are useful during tuning but not part of the minimum code surface needed to understand or run the project.
 

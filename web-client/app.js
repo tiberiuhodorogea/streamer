@@ -213,7 +213,12 @@ class ViewerApp {
     this.statsInterval = null;
     this.connectTimeout = null;
     this.audioMuted = true;
-    this.statsOverlayVisible = false;
+    this.statsOverlayVisible = true;
+    this._socketConnected = false;
+    this._pendingStreamRecovery = false;
+    this._recoveringActiveStream = false;
+    this._transportRecoveryTimer = null;
+    this._localTransportClose = false;
     // Stats tracking
     this._prevBytesReceived = 0;
     this._prevFramesDecoded = 0;
@@ -252,6 +257,7 @@ class ViewerApp {
     document.getElementById('remoteVideo').addEventListener('dblclick', () => this.toggleFullscreen());
     document.addEventListener('fullscreenchange', () => this.syncFullscreenButton());
     document.addEventListener('webkitfullscreenchange', () => this.syncFullscreenButton());
+    this.syncStatsOverlay();
   }
 
   getServerUrl() {
@@ -297,6 +303,63 @@ class ViewerApp {
     });
   }
 
+  setOverlayState(label) {
+    const stateNode = document.getElementById('overlayState');
+    if (stateNode) stateNode.textContent = label;
+  }
+
+  clearTransportRecoveryTimer() {
+    if (this._transportRecoveryTimer) {
+      clearTimeout(this._transportRecoveryTimer);
+      this._transportRecoveryTimer = null;
+    }
+  }
+
+  scheduleActiveStreamRecovery(reason) {
+    if (this._localTransportClose || !this.selectedLumina) return;
+    this.clearTransportRecoveryTimer();
+    this._pendingStreamRecovery = true;
+    this.setOverlayState('Recovering');
+    document.getElementById('connectionQuality').textContent = 'Recovering';
+    debugConsole.warn('Scheduling stream recovery: ' + reason);
+    this._transportRecoveryTimer = setTimeout(() => {
+      this.recoverActiveStream(reason);
+    }, 1500);
+  }
+
+  recoverActiveStream(reason) {
+    if (!this.selectedLumina) return;
+    if (this._recoveringActiveStream) return;
+
+    this.clearTransportRecoveryTimer();
+    this._pendingStreamRecovery = true;
+    this._recoveringActiveStream = true;
+    this.setStatus('Recovering Stream...', 'orange');
+    this.setOverlayState('Recovering');
+    document.getElementById('connectionQuality').textContent = 'Recovering';
+    debugConsole.warn('Attempting stream recovery: ' + reason);
+
+    this.removeConnection({ preserveSelection: true, keepPlayerVisible: true });
+
+    if (!this.socket || !this._socketConnected) {
+      debugConsole.info('Waiting for signaling reconnect before rejoining active stream');
+      return;
+    }
+
+    const viewerName = document.getElementById('viewerName').value;
+    this.socket.emit('join-streamer', {
+      streamerId: this.selectedLumina,
+      viewerName,
+    });
+  }
+
+  syncStatsOverlay() {
+    const overlay = document.getElementById('statsOverlay');
+    const btn = document.getElementById('statsToggleBtn');
+    overlay.style.display = this.statsOverlayVisible ? 'block' : 'none';
+    btn.textContent = this.statsOverlayVisible ? 'Hide Stats' : 'Stats';
+  }
+
   async connect() {
     const serverUrl = this.getServerUrl();
     const viewerName = document.getElementById('viewerName').value.trim();
@@ -325,10 +388,19 @@ class ViewerApp {
     }, 10000);
 
     this.socket.on('connect', () => {
+      const wasRecovering = this._pendingStreamRecovery && Boolean(this.selectedLumina);
+      this._socketConnected = true;
       clearTimeout(this.connectTimeout);
       debugConsole.success('Connected to signaling server');
       this.setStatus('Connected', 'green');
       this.hideSetupPanel();
+
+      if (wasRecovering) {
+        debugConsole.info('Signaling reconnected, rejoining active stream');
+        this.recoverActiveStream('signaling reconnected');
+        return;
+      }
+
       this.loadAvailableStreams();
     });
 
@@ -339,11 +411,20 @@ class ViewerApp {
     });
 
     this.socket.on('reconnecting', (info) => {
+      this._socketConnected = false;
+      if (this.selectedLumina) {
+        this._pendingStreamRecovery = true;
+        this.setOverlayState('Signal Lost');
+      }
       this.setStatus('Reconnecting (' + info.attempt + ')...', 'orange');
     });
 
     this.socket.on('reconnect_failed', () => {
+      this._socketConnected = false;
       this.setStatus('Connection Lost', 'red');
+      if (this.selectedLumina) {
+        this.handleLuminaDisconnected('Viewer connection lost');
+      }
     });
 
     this.socket.on('streamer-joined', () => {
@@ -352,7 +433,7 @@ class ViewerApp {
 
     this.socket.on('streamer-left', (data) => {
       if (this.selectedLumina === data.streamerId) {
-        this.handleLuminaDisconnected();
+        this.handleLuminaDisconnected('Lumina stopped streaming');
       }
       this.loadAvailableStreams();
     });
@@ -363,7 +444,12 @@ class ViewerApp {
       try {
         await this.setupMediasoup(data.routerRtpCapabilities);
         await this.startConsuming();
+        this._pendingStreamRecovery = false;
+        this._recoveringActiveStream = false;
+        this.setOverlayState('Live');
+        this.setStatus('Connected', 'green');
       } catch (error) {
+        this._recoveringActiveStream = false;
         debugConsole.error('SFU setup failed: ' + error.message);
         this.showError('Connection error: ' + error.message);
       }
@@ -398,13 +484,21 @@ class ViewerApp {
 
     this.socket.on('streamer-disconnected', () => {
       debugConsole.warn('Lumina disconnected');
-      this.handleLuminaDisconnected();
+      this.handleLuminaDisconnected('Lumina disconnected');
     });
 
     this.socket.on('disconnect', (reason) => {
+      this._socketConnected = false;
       clearTimeout(this.connectTimeout);
       debugConsole.warn('Socket disconnected: ' + reason);
-      this.setStatus('Reconnecting...', 'orange');
+      if (this.selectedLumina) {
+        this._pendingStreamRecovery = true;
+        this.setStatus('Reconnecting Stream...', 'orange');
+        this.setOverlayState('Signal Lost');
+        document.getElementById('connectionQuality').textContent = 'Signal lost';
+      } else {
+        this.setStatus('Reconnecting...', 'orange');
+      }
     });
 
     this.socket.on('error', (error) => {
@@ -501,8 +595,23 @@ class ViewerApp {
     this.recvTransport.on('connectionstatechange', (state) => {
       debugConsole.info('[SFU] Recv transport state: ' + state);
       document.getElementById('connectionQuality').textContent = state;
-      if (state === 'failed' || state === 'closed') {
-        this.handleLuminaDisconnected();
+      if (state === 'connected') {
+        this.clearTransportRecoveryTimer();
+        this._pendingStreamRecovery = false;
+        this._recoveringActiveStream = false;
+        this.setOverlayState('Live');
+        return;
+      }
+      if (state === 'disconnected') {
+        this.scheduleActiveStreamRecovery('recv transport disconnected');
+        return;
+      }
+      if (state === 'failed') {
+        this.recoverActiveStream('recv transport failed');
+        return;
+      }
+      if (state === 'closed' && !this._localTransportClose) {
+        this.scheduleActiveStreamRecovery('recv transport closed');
       }
     });
 
@@ -616,6 +725,10 @@ class ViewerApp {
         const nackCount = inboundVideo.nackCount || 0;
         const pliCount = inboundVideo.pliCount || 0;
         const firCount = inboundVideo.firCount || 0;
+        const jitterBufferDelayMs = inboundVideo.jitterBufferDelay != null && inboundVideo.jitterBufferEmittedCount > 0
+          ? Number(((inboundVideo.jitterBufferDelay / inboundVideo.jitterBufferEmittedCount) * 1000).toFixed(1)) : null;
+        const decodeLatencyMs = inboundVideo.totalDecodeTime != null && framesDecoded > 0
+          ? Number(((inboundVideo.totalDecodeTime / framesDecoded) * 1000).toFixed(1)) : null;
 
         let fps = null;
         let bitrateMbps = null;
@@ -639,8 +752,11 @@ class ViewerApp {
           }
         }
 
+        const droppedFramesDelta = Math.max(0, framesDropped - (this._prevFramesDropped || 0));
+
         this._prevBytesReceived = bytesReceived;
         this._prevFramesDecoded = framesDecoded;
+        this._prevFramesDropped = framesDropped;
         this._prevPacketsLost = packetsLost;
         this._prevPacketsReceived = packetsReceived;
         this._prevStatsTimestamp = now;
@@ -651,6 +767,7 @@ class ViewerApp {
 
         const jitterMs = inboundVideo.jitter != null ? Number((inboundVideo.jitter * 1000).toFixed(0)) : null;
         document.getElementById('latency').textContent = (jitterMs != null ? jitterMs : '--') + ' ms';
+        const lossPercent = intervalLossRate != null ? Number((intervalLossRate * 100).toFixed(1)) : null;
 
         // Update stats overlay
         if (this.statsOverlayVisible) {
@@ -658,6 +775,8 @@ class ViewerApp {
           document.getElementById('overlayFps').textContent = (fps != null ? fps + ' fps' : '-- fps');
           document.getElementById('overlayBitrate').textContent = (bitrateMbps != null ? bitrateMbps + ' Mbps' : '-- Mbps');
           document.getElementById('overlayJitter').textContent = (jitterMs != null ? jitterMs + ' ms' : '-- ms');
+          document.getElementById('overlayLoss').textContent = (lossPercent != null ? lossPercent + ' %' : '-- %');
+          document.getElementById('overlayDecode').textContent = (decodeLatencyMs != null ? decodeLatencyMs + ' ms' : '-- ms');
         }
 
         if (fps !== null && this.socket && this.selectedLumina) {
@@ -675,6 +794,9 @@ class ViewerApp {
             streamerId: this.selectedLumina,
             fps, bitrateMbps, frameWidth, frameHeight, jitterMs,
             lossRate: Number(lossRate.toFixed(4)),
+            droppedFramesDelta,
+            jitterBufferDelayMs,
+            decodeLatencyMs,
           });
 
           // Detailed diagnostic log every 5 seconds
@@ -685,6 +807,8 @@ class ViewerApp {
               '[DIAG:INBOUND] ' + frameWidth + 'x' + frameHeight +
               ' fps=' + fps + ' bitrate=' + bitrateMbps + 'Mbps' +
               ' jitter=' + (jitterMs != null ? jitterMs : '--') + 'ms' +
+              ' jbuf=' + (jitterBufferDelayMs != null ? jitterBufferDelayMs : '--') + 'ms' +
+              ' decode=' + (decodeLatencyMs != null ? decodeLatencyMs : '--') + 'ms' +
               ' dropped=' + framesDropped + ' lost=' + packetsLost +
               '/' + packetsReceived + 'pkts' +
               ' nack=' + nackCount + ' pli=' + pliCount + ' fir=' + firCount
@@ -697,21 +821,32 @@ class ViewerApp {
     }, 1000);
   }
 
-  async handleLuminaDisconnected() {
+  async handleLuminaDisconnected(message = 'Lumina disconnected') {
+    this._pendingStreamRecovery = false;
+    this._recoveringActiveStream = false;
+    this.clearTransportRecoveryTimer();
     this.removeConnection();
     await this.exitFullscreenIfNeeded();
     this.hidePlayerPanel();
     this.showStreamsPanel();
     document.getElementById('connectionQuality').textContent = '';
-    this.showError('Lumina disconnected');
+    this.selectedLumina = null;
+    this.selectedLuminaName = '';
+    this.setOverlayState('Idle');
+    this.showError(message);
   }
 
   async disconnect() {
     this.hideError();
+    this._pendingStreamRecovery = false;
+    this._recoveringActiveStream = false;
+    this.selectedLumina = null;
+    this.selectedLuminaName = '';
     await this.exitFullscreenIfNeeded();
     this.removeConnection();
     this.hidePlayerPanel();
     this.showStreamsPanel();
+    this.setOverlayState('Idle');
     this.loadAvailableStreams();
   }
 
@@ -783,15 +918,14 @@ class ViewerApp {
 
   toggleStatsOverlay() {
     this.statsOverlayVisible = !this.statsOverlayVisible;
-    const overlay = document.getElementById('statsOverlay');
-    const btn = document.getElementById('statsToggleBtn');
-    overlay.style.display = this.statsOverlayVisible ? 'block' : 'none';
-    btn.textContent = this.statsOverlayVisible ? 'Hide Stats' : 'Stats';
+    this.syncStatsOverlay();
   }
 
-  removeConnection() {
+  removeConnection(options = {}) {
+    const { preserveSelection = false, keepPlayerVisible = false } = options;
     if (this.statsInterval) clearInterval(this.statsInterval);
     this.statsInterval = null;
+    this.clearTransportRecoveryTimer();
 
     // Close all consumers
     for (const consumer of this.consumers.values()) {
@@ -801,8 +935,10 @@ class ViewerApp {
 
     // Close transport
     if (this.recvTransport) {
+      this._localTransportClose = true;
       this.recvTransport.close();
       this.recvTransport = null;
+      this._localTransportClose = false;
     }
 
     this.device = null;
@@ -826,7 +962,22 @@ class ViewerApp {
     this._prevPacketsLost = 0;
     this._prevPacketsReceived = 0;
     this._zeroFpsCount = 0;
+    document.getElementById('overlayRes').textContent = '--';
+    document.getElementById('overlayFps').textContent = '-- fps';
+    document.getElementById('overlayBitrate').textContent = '-- Mbps';
+    document.getElementById('overlayJitter').textContent = '-- ms';
+    document.getElementById('overlayLoss').textContent = '-- %';
+    document.getElementById('overlayDecode').textContent = '-- ms';
+    this.setOverlayState(this._pendingStreamRecovery ? 'Recovering' : 'Idle');
+    if (!preserveSelection) {
+      this.selectedLumina = null;
+      this.selectedLuminaName = '';
+    }
+    if (!keepPlayerVisible) {
+      this.hidePlayerPanel();
+    }
     this.syncFullscreenButton();
+    this.syncStatsOverlay();
   }
 
   hideSetupPanel() { document.getElementById('setupPanel').style.display = 'none'; }

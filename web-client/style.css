@@ -337,21 +337,32 @@ section h2 {
   position: absolute;
   top: 14px;
   right: 14px;
-  min-width: 128px;
-  padding: 10px 12px;
+  z-index: 3;
+  min-width: 198px;
+  padding: 12px 14px;
   border-radius: 14px;
-  background: rgba(10, 9, 7, 0.78);
-  border: 1px solid rgba(201, 171, 109, 0.20);
+  background: linear-gradient(180deg, rgba(10, 9, 7, 0.84), rgba(21, 18, 14, 0.74));
+  border: 1px solid rgba(201, 171, 109, 0.24);
   color: #f0e6d3;
   font-family: Consolas, "Courier New", monospace;
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: 12px;
+  line-height: 1.5;
   pointer-events: none;
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
 }
 
 .stats-overlay-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
   white-space: nowrap;
+}
+
+.stats-overlay-label {
+  color: rgba(240, 230, 211, 0.72);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 .player-container:fullscreen,
@@ -367,6 +378,12 @@ section h2 {
   width: 100vw;
   height: 100vh;
   max-height: none;
+}
+
+.player-container:fullscreen .stats-overlay,
+.player-container:-webkit-full-screen .stats-overlay {
+  top: 18px;
+  right: 18px;
 }
 
 .video-stats {

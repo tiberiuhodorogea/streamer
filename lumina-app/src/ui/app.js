@@ -149,6 +149,50 @@ class SignalClient {
   }
 }
 
+const KNOWN_GAME_TITLE_ALIASES = [
+  {
+    canonical: 'deadbydaylight',
+    processName: 'DeadByDaylight-Win64-Shipping',
+    aliases: [
+      'deadbydaylight',
+      'dead by daylight',
+      'deadbydaylightwin64shipping',
+      'deadbydaylightwin64',
+      'deadbydaylightshipping',
+    ],
+  },
+];
+
+function normalizeGameTitle(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function stripKnownGameSuffixes(name) {
+  return normalizeGameTitle(name)
+    .replace(/win64shipping|win32shipping|shipping|launcher|bootstrapper|exe|x64|x86/g, '');
+}
+
+function inferKnownGameFromTitle(name) {
+  const sourceKey = normalizeGameTitle(name);
+  const sourceBase = stripKnownGameSuffixes(name);
+  if (!sourceKey && !sourceBase) return null;
+
+  for (const entry of KNOWN_GAME_TITLE_ALIASES) {
+    for (const alias of entry.aliases) {
+      const aliasKey = normalizeGameTitle(alias);
+      const aliasBase = stripKnownGameSuffixes(alias);
+      if (!aliasKey && !aliasBase) continue;
+      if (sourceKey === aliasKey || sourceBase === aliasBase) return entry;
+      if (aliasBase && (sourceKey.includes(aliasBase) || sourceBase.includes(aliasBase))) return entry;
+      if (sourceBase && (aliasKey.includes(sourceBase) || aliasBase.includes(sourceBase))) return entry;
+    }
+  }
+
+  return null;
+}
+
 // ============================================
 // DEBUG LOGGER UTILITY
 // ============================================
@@ -201,96 +245,90 @@ class DebugLogger {
 const logger = new DebugLogger();
 
 // ============================================
-// QUALITY PROFILES
+// SMOOTHNESS-FIRST STREAMING PROFILE
 // ============================================
-const QUALITY_PROFILES = {
-  quality: {
-    label: 'Quality 1080p',
-    hint: 'Full HD target with adaptive headroom for cleaner motion',
-    summary: '1080p / 60 fps / 18 Mbps cap',
-    maxWidth: 1920,
-    maxHeight: 1080,
-    maxFrameRate: 60,
-    maxBitrate: 18_000_000,
-  },
-  ultra: {
-    label: 'Ultra 2K',
-    hint: 'Maximum resolution with the same adaptive quality stack',
-    summary: '2K (1440p) / 60 fps / 20 Mbps cap',
-    maxWidth: 2560,
-    maxHeight: 1440,
-    maxFrameRate: 60,
-    maxBitrate: 20_000_000,
-  }
+const SMOOTHNESS_PROFILE = {
+  label: 'Auto Smoothness',
+  hint: 'Automatic 1080p/60 target that protects motion first and detail second',
+  summary: 'Automatic 1080p / 60 fps with continuous network-aware adaptation',
+  maxWidth: 1920,
+  maxHeight: 1080,
+  maxFrameRate: 60,
+  maxBitrate: 16_000_000,
+  startBitrate: 9_000_000,
+  minBitrate: 2_500_000,
 };
 
 // ============================================
-// DEGRADATION TIERS
-// Combines bitrate, FPS, and resolution scaling for optimal quality at each level.
-// Order: first cut bitrate → then halve FPS → then scale down resolution.
+// ADAPTIVE LADDER
+// Order: cut bitrate first, then shave resolution, and only reduce FPS as a late emergency action.
 // ============================================
 const DEGRADATION_TIERS = [
-  { bitratePct: 1.00, scaleDown: 1.0, fpsFraction: 1.0, label: 'MAX'  },  // full profile quality
-  { bitratePct: 0.75, scaleDown: 1.0, fpsFraction: 1.0, label: 'HIGH' },  // mild bitrate cut, encoder absorbs
-  { bitratePct: 0.55, scaleDown: 1.0, fpsFraction: 0.5, label: 'MID'  },  // halve FPS → doubles per-frame budget
-  { bitratePct: 0.40, scaleDown: 1.5, fpsFraction: 0.5, label: 'LOW'  },  // scale down res → crisper pixels
-  { bitratePct: 0.25, scaleDown: 2.0, fpsFraction: 0.5, label: 'MIN'  },  // heavy downscale, last resort
+  { bitratePct: 1.00, scaleDown: 1.0, fpsFraction: 1.0, label: 'FULL' },
+  { bitratePct: 0.82, scaleDown: 1.0, fpsFraction: 1.0, label: 'FLOW' },
+  { bitratePct: 0.68, scaleDown: 1.15, fpsFraction: 1.0, label: 'SAFE' },
+  { bitratePct: 0.54, scaleDown: 1.35, fpsFraction: 1.0, label: 'SHIELD' },
+  { bitratePct: 0.40, scaleDown: 1.6, fpsFraction: 0.83, label: 'RESCUE' },
+  { bitratePct: 0.30, scaleDown: 2.0, fpsFraction: 0.67, label: 'LAST' },
 ];
-
-
 
 // ============================================
 // ADAPTIVE QUALITY CONTROLLER
-// Navigates tiers based on viewer health signals.
-// Degrades fast (2s cooldown), recovers aggressively (3s of good health).
+// Prioritizes frame pacing, fast recovery, and multi-viewer fairness.
 // ============================================
 class AdaptiveQualityController {
   constructor(luminaApp) {
     this.app = luminaApp;
     this.enabled = true;
-    this.tierIndex = 0;               // current tier (0 = max quality)
-    this.profileMaxBitrate = 0;
-    this.profileMaxFps = 60;
-    this.floor = 1_500_000;           // absolute minimum bitrate
+    this.startupTierIndex = 1;
+    this.tierIndex = this.startupTierIndex;
+    this.profileMaxBitrate = SMOOTHNESS_PROFILE.maxBitrate;
+    this.profileMaxFps = SMOOTHNESS_PROFILE.maxFrameRate;
+    this.floor = SMOOTHNESS_PROFILE.minBitrate;
 
-    // Viewer health tracking
     this.viewerHealth = new Map();
+    this._producerStats = {
+      bitrateMbps: 0,
+      fps: 0,
+      stallSeconds: 0,
+      lastUpdatedAt: 0,
+      lastLoggedStallSeconds: 0,
+    };
 
-    // Timing
     this.lastDegradeTime = 0;
     this.lastRecoverTime = 0;
     this.goodHealthStart = 0;
-    this._streamStartTime = 0;        // set when stream begins
-    this._stuckAtMinSince = 0;        // for periodic recovery probe
+    this._streamStartTime = 0;
+    this._stuckAtMinSince = 0;
+    this._lastHealthState = 'starting';
+    this._warningStreak = 0;
+    this._isolatedStreak = 0;
 
-    // Tuning — designed for internet/Tailscale connections (30-50ms baseline jitter)
-    this.degradeCooldownMs = 4000;    // 4s between degrade steps (prevent cascade)
-    this.recoverCooldownMs = 5000;    // 5s between recover steps
-    this.recoverWaitMs = 5000;        // 5s continuous good health before step-up
-    this.startupGraceMs = 12000;      // 12s grace after stream start — encoder ramps up
+    this.degradeCooldownMs = 2500;
+    this.warningDegradeCooldownMs = 6000;
+    this.recoverCooldownMs = 1500;
+    this.recoverWaitMs = 2500;
+    this.startupRampMs = 4000;
 
-    // Jitter thresholds — internet has 30-50ms baseline, only react to real congestion
-    this.jitterWarnMs = 65;
-    this.jitterCriticalMs = 100;
+    this.jitterWarnMs = 55;
+    this.jitterCriticalMs = 85;
+    this.jitterBufferWarnMs = 115;
+    this.jitterBufferCriticalMs = 170;
+    this.decodeLatencyWarnMs = 18;
+    this.decodeLatencyCriticalMs = 30;
+    this.lossWarnRate = 0.03;
+    this.lossCriticalRate = 0.06;
+    this.recoveryProbeMs = 12000;
 
-    // Loss thresholds — some connections have 2-4% baseline
-    this.lossWarnRate = 0.05;
-    this.lossCriticalRate = 0.10;
+    this._serverBwe = null;
+    this._serverBweTime = 0;
 
-    // Recovery probe: if stuck at MIN for this long, force a step-up attempt
-    this.recoveryProbeMs = 30000;     // 30s at MIN → try stepping up
-
-    // Server-side BWE data (updated from signaling server RTCP polling)
-    this._serverBwe = null;           // latest server-bwe event
-    this._serverBweTime = 0;          // timestamp of last server-bwe
-
-    // BWE thresholds for early warning
-    this.rttWarnMs = 150;             // RTT above 150ms = warning
-    this.rttCriticalMs = 300;         // RTT above 300ms = critical
-    this.nackRateWarn = 0.05;         // >5% packets NACKed = warning
-    this.nackRateCritical = 0.15;     // >15% packets NACKed = critical
-    this.scoreWarn = 6;               // mediasoup score below 6 = warning
-    this.scoreCritical = 3;           // mediasoup score below 3 = critical
+    this.rttWarnMs = 130;
+    this.rttCriticalMs = 220;
+    this.nackRateWarn = 0.03;
+    this.nackRateCritical = 0.08;
+    this.scoreWarn = 7;
+    this.scoreCritical = 4;
   }
 
   get tiers() { return DEGRADATION_TIERS; }
@@ -302,15 +340,19 @@ class AdaptiveQualityController {
   }
 
   get effectiveFps() {
-    return Math.max(15, Math.round(this.profileMaxFps * this.currentTier.fpsFraction));
+    return Math.max(24, Math.round(this.profileMaxFps * this.currentTier.fpsFraction));
   }
 
   setProfile(bitrate, fps) {
     this.profileMaxBitrate = bitrate;
     this.profileMaxFps = fps || 60;
-    this.tierIndex = 0; // reset to max quality on profile change
+    this.floor = Math.max(SMOOTHNESS_PROFILE.minBitrate, Math.round(this.profileMaxBitrate * 0.18));
+    this.tierIndex = Math.min(this.startupTierIndex, this.tiers.length - 1);
     this._streamStartTime = Date.now();
     this._stuckAtMinSince = 0;
+    this._warningStreak = 0;
+    this._isolatedStreak = 0;
+    this._lastHealthState = 'starting';
     this._applyTier();
   }
 
@@ -322,10 +364,14 @@ class AdaptiveQualityController {
       health = {
         fpsSamples: [],
         jitterSamples: [],
+        droppedFramesSamples: [],
+        jitterBufferSamples: [],
+        decodeLatencySamples: [],
         lossRate: 0,
         baselineFps: 0,
         baselineSamples: 0,
         bitrateMbps: 0,
+        lastReportAt: 0,
       };
       this.viewerHealth.set(viewerId, health);
     }
@@ -337,10 +383,19 @@ class AdaptiveQualityController {
     health.jitterSamples.push(report.jitterMs || 0);
     if (health.jitterSamples.length > 8) health.jitterSamples.shift();
 
+    health.droppedFramesSamples.push(report.droppedFramesDelta || 0);
+    if (health.droppedFramesSamples.length > 8) health.droppedFramesSamples.shift();
+
+    health.jitterBufferSamples.push(report.jitterBufferDelayMs || 0);
+    if (health.jitterBufferSamples.length > 8) health.jitterBufferSamples.shift();
+
+    health.decodeLatencySamples.push(report.decodeLatencyMs || 0);
+    if (health.decodeLatencySamples.length > 8) health.decodeLatencySamples.shift();
+
     health.lossRate = report.lossRate || 0;
     health.bitrateMbps = report.bitrateMbps || 0;
+    health.lastReportAt = Date.now();
 
-    // Learn baseline FPS via EMA (only healthy samples > 5fps)
     if (fps > 5) {
       if (health.baselineSamples < 5) {
         health.baselineFps = ((health.baselineFps * health.baselineSamples) + fps) / (health.baselineSamples + 1);
@@ -355,88 +410,129 @@ class AdaptiveQualityController {
     this.viewerHealth.delete(viewerId);
   }
 
-  // Called when server sends RTCP-based BWE data
   onServerBwe(bweData) {
     this._serverBwe = bweData;
     this._serverBweTime = Date.now();
   }
 
-  // Called every stats tick (~1s)
+  updateProducerStats(stats) {
+    this._producerStats.bitrateMbps = stats.bitrateMbps || 0;
+    this._producerStats.fps = stats.fps || 0;
+    this._producerStats.lastUpdatedAt = Date.now();
+
+    const targetFps = this.effectiveFps;
+    const severeEncodeDip = stats.fps != null && stats.fps < Math.max(12, targetFps * 0.4);
+    const severeBitrateDip = stats.bitrateMbps != null && stats.bitrateMbps < Math.max(0.75, (this.effectiveBitrate / 1e6) * 0.22);
+
+    if (severeEncodeDip && severeBitrateDip) {
+      this._producerStats.stallSeconds += 1;
+      if (this._producerStats.stallSeconds >= 3 &&
+          this._producerStats.lastLoggedStallSeconds !== this._producerStats.stallSeconds) {
+        this._producerStats.lastLoggedStallSeconds = this._producerStats.stallSeconds;
+        this._logSession('encoder-stall', {
+          stallSeconds: this._producerStats.stallSeconds,
+          bitrateMbps: Number((stats.bitrateMbps || 0).toFixed(2)),
+          fps: stats.fps || 0,
+          tier: this.currentTier.label,
+        });
+      }
+    } else {
+      this._producerStats.stallSeconds = Math.max(0, this._producerStats.stallSeconds - 1);
+      if (this._producerStats.stallSeconds === 0) {
+        this._producerStats.lastLoggedStallSeconds = 0;
+      }
+    }
+  }
+
+  _logSession(type, payload) {
+    if (window.electron?.sessionLog) {
+      window.electron.sessionLog(type, payload);
+    }
+  }
+
   evaluate() {
     if (!this.enabled || this.viewerHealth.size === 0) return;
 
     const now = Date.now();
     const assessment = this._assessHealth();
+    this._reportAssessment(assessment);
 
-    // Detailed per-tick diagnostics (every tick for tuning)
     if (!this._evalCounter) this._evalCounter = 0;
     this._evalCounter++;
-    if (this._evalCounter % 3 === 0) { // every 3s to avoid spam
-      let diag = '[ABR:TICK] tier=' + this.currentTier.label + ' health=' + assessment;
+    if (this._evalCounter % 3 === 0) {
+      let diag = '[ABR:TICK] tier=' + this.currentTier.label + ' health=' + assessment.state;
       for (const [viewerId, health] of this.viewerHealth) {
         const recent = health.fpsSamples.slice(-3);
         const recentAvg = recent.length ? (recent.reduce((a, b) => a + b, 0) / recent.length).toFixed(1) : '?';
         const baseline = health.baselineSamples >= 3 ? health.baselineFps.toFixed(1) : '(learning)';
         const jRecent = health.jitterSamples.slice(-3);
         const jAvg = jRecent.length ? (jRecent.reduce((a, b) => a + b, 0) / jRecent.length).toFixed(1) : '?';
-        diag += ' | v=' + viewerId.substring(0, 6) + ' fps=' + recentAvg + '/' + baseline + ' jitter=' + jAvg + 'ms loss=' + (health.lossRate * 100).toFixed(1) + '%';
+        const dropRecent = health.droppedFramesSamples.slice(-3);
+        const dropAvg = dropRecent.length ? (dropRecent.reduce((a, b) => a + b, 0) / dropRecent.length).toFixed(1) : '0';
+        diag += ' | v=' + viewerId.substring(0, 6) + ' fps=' + recentAvg + '/' + baseline + ' jitter=' + jAvg + 'ms loss=' + (health.lossRate * 100).toFixed(1) + '% drops=' + dropAvg;
       }
       if (this.goodHealthStart) {
         diag += ' | goodFor=' + ((now - this.goodHealthStart) / 1000).toFixed(1) + 's';
       }
-      // Append server BWE summary if available
+      if (assessment.bottleneckViewerId) {
+        diag += ' | bottleneck=' + assessment.bottleneckViewerId.substring(0, 6);
+      }
       const bwe = this._serverBwe;
       const bweAge = now - this._serverBweTime;
-      if (bwe && bweAge < 6000) {
+      if (bwe && bweAge < 5000) {
         const agg = bwe.aggregate;
-        diag += ' | BWE rtt=' + (agg.worstRttMs || '--') + 'ms nack=' + ((agg.worstNackRate || 0) * 100).toFixed(1) + '% score=' + (agg.minScore != null ? agg.minScore : '--') + ' avail=' + (agg.minAvailableMbps != null ? agg.minAvailableMbps.toFixed(1) : '--') + 'Mbps';
+        diag += ' | BWE rtt=' + (agg.worstRttMs || '--') + 'ms nack=' + ((agg.worstNackRate || 0) * 100).toFixed(1) + '% score=' + (agg.minScore != null ? agg.minScore : '--') + ' avail=' + (agg.minAvailableMbps != null ? agg.minAvailableMbps.toFixed(1) : '--') + 'Mbps spread=' + (agg.viewerSpreadMbps != null ? agg.viewerSpreadMbps.toFixed(1) : '--') + 'Mbps';
       }
       logger.debug(diag);
     }
 
-    // Startup grace: don't degrade while encoder is ramping up
-    const inGrace = (now - this._streamStartTime) < this.startupGraceMs;
+    const inStartupRamp = (now - this._streamStartTime) < this.startupRampMs;
 
-    if (assessment === 'source-stall') {
-      // Source stopped producing — don't degrade, just log
-      if (this._evalCounter % 3 === 0) {
-        logger.warn('[ABR] Source stall detected (all viewers 0fps/0bps) — holding tier ' + this.currentTier.label);
-      }
-    } else if (!inGrace && assessment === 'critical') {
+    if (assessment.state === 'source-stall') {
+      this.goodHealthStart = 0;
+      return;
+    }
+
+    if (assessment.state === 'critical' || assessment.state === 'encoder-stall') {
+      this._warningStreak = 0;
+      this._isolatedStreak = 0;
+      this.goodHealthStart = 0;
       if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
-        this._stepDown(2); // emergency: skip 2 tiers
+        this._stepDown(assessment.state === 'critical' ? 2 : 1, assessment);
         this._stuckAtMinSince = 0;
       }
-    } else if (!inGrace && assessment === 'warning') {
-      if (now - this.lastDegradeTime >= this.degradeCooldownMs) {
-        this._stepDown(1);
+    } else if (assessment.state === 'warning') {
+      this._warningStreak++;
+      this._isolatedStreak = 0;
+      this.goodHealthStart = 0;
+      if (this._warningStreak >= 3 &&
+          this._shouldDegradeOnWarning(assessment) &&
+          now - this.lastDegradeTime >= this.warningDegradeCooldownMs) {
+        this._stepDown(1, assessment);
         this._stuckAtMinSince = 0;
       }
-    } else if (assessment === 'good') {
+    } else if (assessment.state === 'isolated-warning' || assessment.state === 'isolated-critical') {
+      this._warningStreak = 0;
+      this._isolatedStreak++;
+      this.goodHealthStart = 0;
+      const isolatedThreshold = assessment.state === 'isolated-critical' ? 2 : 4;
+      if (this._isolatedStreak >= isolatedThreshold &&
+          this._shouldDegradeOnWarning(assessment) &&
+          now - this.lastDegradeTime >= this.warningDegradeCooldownMs) {
+        this._stepDown(1, assessment);
+        this._stuckAtMinSince = 0;
+      }
+    } else if (assessment.state === 'good') {
+      this._warningStreak = 0;
+      this._isolatedStreak = 0;
       if (this.tierIndex > 0) {
         if (!this.goodHealthStart) {
           this.goodHealthStart = now;
-        } else if (now - this.goodHealthStart >= this.recoverWaitMs &&
-                   now - this.lastRecoverTime >= this.recoverCooldownMs) {
-          // Gate: only step up if actual bitrate can support the next tier
-          // Use server BWE available bitrate if available (more accurate than viewer report)
-          const nextTier = this.tiers[this.tierIndex - 1];
-          const neededMbps = (this.profileMaxBitrate * nextTier.bitratePct) / 1e6;
-          const viewerMbps = this._getMinViewerBitrate();
-          const bwe = this._serverBwe;
-          const bweAge = now - this._serverBweTime;
-          const bweAvail = (bwe && bweAge < 6000 && bwe.aggregate.minAvailableMbps != null)
-            ? bwe.aggregate.minAvailableMbps : null;
-          // Prefer BWE available bitrate (transport estimate), fall back to viewer-reported
-          const currentMbps = bweAvail != null ? Math.min(bweAvail, viewerMbps) : viewerMbps;
-          if (currentMbps >= neededMbps * 0.35) {
-            const veryGood = this._isVeryGoodHealth();
-            this._stepUp(veryGood ? 2 : 1);
-          } else {
-            if (this._evalCounter % 3 === 0) {
-              logger.debug('[ABR] Recovery gated: need ' + neededMbps.toFixed(1) + 'Mbps, actual=' + currentMbps.toFixed(1) + 'Mbps');
-            }
-          }
+        } else if (now - this.goodHealthStart >= (inStartupRamp ? 1500 : this.recoverWaitMs) &&
+                   now - this.lastRecoverTime >= this.recoverCooldownMs &&
+                   this._canStepUp(now)) {
+          const veryGood = this._isVeryGoodHealth();
+          this._stepUp(inStartupRamp ? 1 : (veryGood ? 2 : 1), assessment);
         }
       } else {
         this.goodHealthStart = 0;
@@ -444,16 +540,15 @@ class AdaptiveQualityController {
       }
     }
 
-    // Recovery probe: if stuck at bottom tier too long, force a step-up attempt
     if (this.tierIndex === this.tiers.length - 1) {
       if (!this._stuckAtMinSince) {
         this._stuckAtMinSince = now;
       } else if (now - this._stuckAtMinSince >= this.recoveryProbeMs &&
-                 assessment !== 'critical') {
-        logger.info('[ABR] Recovery probe — stuck at MIN for ' +
+                 assessment.state !== 'critical' && assessment.state !== 'encoder-stall') {
+        logger.info('[ABR] Recovery probe — stuck at LAST for ' +
           ((now - this._stuckAtMinSince) / 1000).toFixed(0) + 's, trying step up');
-        this._stepUp(1);
-        this._stuckAtMinSince = now; // reset so we don't probe again immediately
+        this._stepUp(1, assessment);
+        this._stuckAtMinSince = now;
       }
     } else {
       this._stuckAtMinSince = 0;
@@ -463,13 +558,15 @@ class AdaptiveQualityController {
   _assessHealth() {
     let worstJitter = 0;
     let worstLoss = 0;
-    let hasZeroFps = false;
-    let hasFpsCrash = false;
-    let hasFpsDrop = false;
-    let allZeroBitrate = true;  // source-freeze detection
     let viewerCount = 0;
+    let warningViewers = 0;
+    let criticalViewers = 0;
+    let allZeroViewers = true;
+    let bottleneckViewerId = null;
+    let worstViewerScore = -Infinity;
+    let worstDecodeLatency = 0;
 
-    for (const [, health] of this.viewerHealth) {
+    for (const [viewerId, health] of this.viewerHealth) {
       if (health.fpsSamples.length < 2) continue;
       viewerCount++;
 
@@ -477,63 +574,191 @@ class AdaptiveQualityController {
       const recentAvg = recent.reduce((a, b) => a + b, 0) / recent.length;
       const baseline = health.baselineSamples >= 3 ? health.baselineFps : recentAvg;
       const avgJitter = health.jitterSamples.slice(-3).reduce((a, b) => a + b, 0) / Math.min(health.jitterSamples.length, 3);
+      const avgDrops = health.droppedFramesSamples.slice(-3).reduce((a, b) => a + b, 0) / Math.max(1, Math.min(health.droppedFramesSamples.length, 3));
+      const avgJitterBuffer = health.jitterBufferSamples.slice(-3).reduce((a, b) => a + b, 0) / Math.max(1, Math.min(health.jitterBufferSamples.length, 3));
+      const avgDecodeLatency = health.decodeLatencySamples.slice(-3).reduce((a, b) => a + b, 0) / Math.max(1, Math.min(health.decodeLatencySamples.length, 3));
 
-      const crashThreshold = 0.3;
-      const warnThreshold = 0.6;
+      let score = 0;
+      let viewerState = 'good';
+      if (baseline > 5 && recentAvg < baseline * 0.45) {
+        score += 4;
+        viewerState = 'critical';
+      } else if (baseline > 5 && recentAvg < baseline * 0.75) {
+        score += 2;
+        viewerState = 'warning';
+      }
+      if (avgJitter > this.jitterCriticalMs ||
+          health.lossRate > this.lossCriticalRate ||
+          avgDrops >= 6 ||
+          avgDecodeLatency > this.decodeLatencyCriticalMs ||
+          (avgJitterBuffer > this.jitterBufferCriticalMs && avgDecodeLatency > this.decodeLatencyWarnMs)) {
+        score += 3;
+        viewerState = 'critical';
+      } else if (avgJitter > this.jitterWarnMs ||
+                 health.lossRate > this.lossWarnRate ||
+                 avgDrops >= 2 ||
+                 avgDecodeLatency > this.decodeLatencyWarnMs ||
+                 (avgJitterBuffer > this.jitterBufferWarnMs && avgDecodeLatency > this.decodeLatencyWarnMs)) {
+        score += 1;
+        if (viewerState === 'good') viewerState = 'warning';
+      }
 
-      if (recent.some(f => f === 0)) hasZeroFps = true;
-      if (baseline > 5 && recentAvg < baseline * crashThreshold) hasFpsCrash = true;
-      if (baseline > 5 && recentAvg < baseline * warnThreshold) hasFpsDrop = true;
+      if (viewerState === 'critical') criticalViewers++;
+      else if (viewerState === 'warning') warningViewers++;
+
+      if (score > worstViewerScore) {
+        worstViewerScore = score;
+        bottleneckViewerId = viewerId;
+      }
 
       worstJitter = Math.max(worstJitter, avgJitter);
       worstLoss = Math.max(worstLoss, health.lossRate);
-
-      // Track if any viewer has non-zero bitrate (to detect source freeze)
-      if (recentAvg > 0) allZeroBitrate = false;
+      worstDecodeLatency = Math.max(worstDecodeLatency, avgDecodeLatency);
+      if (recentAvg > 0 || health.bitrateMbps > 0.3) allZeroViewers = false;
     }
 
-    // SOURCE FREEZE: all viewers at 0fps simultaneously = encoder stopped, not network
-    // Don't degrade — degrading won't help; just hold current tier
-    if (viewerCount > 0 && hasZeroFps && allZeroBitrate) {
-      return 'source-stall';  // special: no action taken
+    if (viewerCount > 0 && allZeroViewers) {
+      return {
+        state: 'source-stall',
+        reason: 'all-viewers-stalled',
+        viewerCount,
+        warningViewers,
+        criticalViewers,
+        bottleneckViewerId,
+      };
     }
 
-    // ── Server-side BWE signals (RTCP-derived, leading indicators) ──
-    // BWE data is fresher and more reliable than viewer self-reports for
-    // transport-level congestion. Use RTT, NACK rate, and mediasoup score
-    // as early-warning escalators.
     let bweWarn = false;
     let bweCritical = false;
+    let isolatedTransport = false;
+    let aggregate = null;
     const bwe = this._serverBwe;
     const bweAge = Date.now() - this._serverBweTime;
-    if (bwe && bweAge < 6000) {  // only use BWE data if < 6s old
-      const agg = bwe.aggregate;
-      // RTT spike = congestion indicator (only trust values < 10s, null means unavailable)
-      if (agg.worstRttMs != null && agg.worstRttMs > 0 && agg.worstRttMs < 10000) {
-        if (agg.worstRttMs > this.rttCriticalMs) bweCritical = true;
-        else if (agg.worstRttMs > this.rttWarnMs) bweWarn = true;
+    if (bwe && bweAge < 5000) {
+      aggregate = bwe.aggregate;
+      if (aggregate.worstRttMs != null && aggregate.worstRttMs > 0 && aggregate.worstRttMs < 10000) {
+        if (aggregate.worstRttMs > this.rttCriticalMs) bweCritical = true;
+        else if (aggregate.worstRttMs > this.rttWarnMs) bweWarn = true;
       }
-      // High NACK rate = packets being lost and retransmitted
-      if (agg.worstNackRate > this.nackRateCritical) bweCritical = true;
-      else if (agg.worstNackRate > this.nackRateWarn) bweWarn = true;
-      // Low mediasoup score = overall quality degradation
-      if (agg.minScore != null) {
-        if (agg.minScore <= this.scoreCritical) bweCritical = true;
-        else if (agg.minScore <= this.scoreWarn) bweWarn = true;
+      if (aggregate.worstNackRate > this.nackRateCritical) bweCritical = true;
+      else if (aggregate.worstNackRate > this.nackRateWarn) bweWarn = true;
+      if (aggregate.minScore != null) {
+        if (aggregate.minScore <= this.scoreCritical) bweCritical = true;
+        else if (aggregate.minScore <= this.scoreWarn) bweWarn = true;
+      }
+      if (aggregate.bottleneckViewerId) bottleneckViewerId = aggregate.bottleneckViewerId;
+      if (aggregate.lowHeadroomViewers === 1 && viewerCount > 1 && aggregate.viewerSpreadMbps >= 3) {
+        isolatedTransport = true;
       }
     }
 
-    // Critical: zero fps OR fps crash OR extreme jitter OR extreme loss OR BWE critical
-    if (hasZeroFps || hasFpsCrash || worstJitter > this.jitterCriticalMs || worstLoss > this.lossCriticalRate || bweCritical) {
-      return 'critical';
+    if (this._producerStats.stallSeconds >= 2) {
+      return {
+        state: 'encoder-stall',
+        reason: 'encoder-stall',
+        viewerCount,
+        warningViewers,
+        criticalViewers,
+        bottleneckViewerId,
+        worstDecodeLatency,
+        aggregate,
+      };
     }
-    // Warning: fps drop OR high jitter OR notable loss OR BWE warning
-    // Loss alone only triggers warning if combined with elevated jitter (>40ms)
-    if (hasFpsDrop || worstJitter > this.jitterWarnMs ||
-        (worstLoss > this.lossWarnRate && worstJitter > 40) || bweWarn) {
-      return 'warning';
+
+    const impactedThreshold = Math.max(1, Math.ceil(viewerCount / 2));
+    let state = 'good';
+    if (criticalViewers >= impactedThreshold || bweCritical) {
+      state = 'critical';
+    } else if (criticalViewers === 1 && viewerCount > 1 && !bweCritical) {
+      state = isolatedTransport ? 'warning' : 'isolated-critical';
+    } else if (warningViewers >= impactedThreshold || bweWarn) {
+      state = 'warning';
+    } else if (warningViewers === 1 && viewerCount > 1) {
+      state = isolatedTransport ? 'warning' : 'isolated-warning';
     }
-    return 'good';
+
+    return {
+      state,
+      reason: [
+        criticalViewers ? ('critical-viewers=' + criticalViewers) : null,
+        warningViewers ? ('warning-viewers=' + warningViewers) : null,
+        bweCritical ? 'bwe-critical' : null,
+        bweWarn ? 'bwe-warning' : null,
+      ].filter(Boolean).join(','),
+      viewerCount,
+      warningViewers,
+      criticalViewers,
+      worstJitter,
+      worstLoss,
+      worstDecodeLatency,
+      bottleneckViewerId,
+      aggregate,
+    };
+  }
+
+  _reportAssessment(assessment) {
+    if (assessment.state !== this._lastHealthState) {
+      logger.info('[ABR] Health ' + this._lastHealthState + ' -> ' + assessment.state +
+        (assessment.reason ? ' (' + assessment.reason + ')' : ''));
+      this._logSession('network-health', {
+        state: assessment.state,
+        previousState: this._lastHealthState,
+        reason: assessment.reason || null,
+        tier: this.currentTier.label,
+        viewerCount: assessment.viewerCount || 0,
+        warningViewers: assessment.warningViewers || 0,
+        criticalViewers: assessment.criticalViewers || 0,
+        bottleneckViewerId: assessment.bottleneckViewerId || null,
+      });
+      this._lastHealthState = assessment.state;
+    }
+  }
+
+  _canStepUp(now) {
+    if (this.tierIndex === 0) return false;
+
+    const nextTier = this.tiers[this.tierIndex - 1];
+    const neededMbps = (this.profileMaxBitrate * nextTier.bitratePct) / 1e6;
+    const viewerMbps = this._getMinViewerBitrate();
+    let currentMbps = viewerMbps;
+
+    const bwe = this._serverBwe;
+    const bweAge = now - this._serverBweTime;
+    if (bwe && bweAge < 5000) {
+      const agg = bwe.aggregate;
+      currentMbps = Math.max(currentMbps, agg.medianDeliveryMbps || 0, agg.minAvailableMbps || 0);
+      if ((agg.lowHeadroomViewers || 0) > 0 && (agg.bottleneckStreak || 0) >= 2) {
+        return false;
+      }
+    }
+
+    const threshold = this.tierIndex === this.startupTierIndex ? 0.55 : 0.72;
+    if (currentMbps < neededMbps * threshold) {
+      if (this._evalCounter % 3 === 0) {
+        logger.debug('[ABR] Recovery gated: need ' + neededMbps.toFixed(1) + 'Mbps, actual=' + currentMbps.toFixed(1) + 'Mbps');
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  _shouldDegradeOnWarning(assessment) {
+    const aggregate = assessment.aggregate;
+    const currentTargetMbps = this.effectiveBitrate / 1e6;
+    const viewerDeliveryMbps = Math.max(this._getMinViewerBitrate(), aggregate?.minDeliveryMbps || 0);
+    const availableMbps = aggregate?.minAvailableMbps || 0;
+    const transportPressure =
+      (aggregate?.worstRttMs || 0) > this.rttWarnMs ||
+      (aggregate?.worstNackRate || 0) > this.nackRateWarn ||
+      (aggregate?.minScore != null && aggregate.minScore <= this.scoreWarn);
+    const headroomTight =
+      (availableMbps > 0 && availableMbps < currentTargetMbps * 0.9) ||
+      (viewerDeliveryMbps > 0 && viewerDeliveryMbps < currentTargetMbps * 0.72);
+    const decodePressure = (assessment.worstDecodeLatency || 0) > this.decodeLatencyWarnMs;
+    const viewerPressure = (assessment.worstLoss || 0) > this.lossWarnRate;
+
+    return transportPressure || headroomTight || decodePressure || viewerPressure;
   }
 
   _isVeryGoodHealth() {
@@ -546,19 +771,21 @@ class AdaptiveQualityController {
       const baseline = health.baselineSamples >= 3 ? health.baselineFps : recentAvg;
       const jRecent = health.jitterSamples.slice(-3);
       const jAvg = jRecent.reduce((a, b) => a + b, 0) / jRecent.length;
+      const drops = health.droppedFramesSamples.slice(-3).reduce((a, b) => a + b, 0);
       if (baseline > 5 && recentAvg < baseline * 0.95) return false;
-      if (jAvg > 30) return false;
+      if (jAvg > 25) return false;
       if (health.lossRate > 0.01) return false;
+      if (drops > 2) return false;
     }
 
-    // Also check server BWE: very good requires clean transport
     const bwe = this._serverBwe;
     const bweAge = Date.now() - this._serverBweTime;
     if (bwe && bweAge < 6000) {
       const agg = bwe.aggregate;
-      if (agg.worstRttMs > 100) return false;       // RTT should be low
-      if (agg.worstNackRate > 0.02) return false;    // minimal retransmissions
-      if (agg.minScore != null && agg.minScore < 7) return false;  // good score
+      if (agg.worstRttMs > 100) return false;
+      if (agg.worstNackRate > 0.02) return false;
+      if (agg.minScore != null && agg.minScore < 8) return false;
+      if ((agg.lowHeadroomViewers || 0) > 0) return false;
     }
 
     return true;
@@ -572,11 +799,10 @@ class AdaptiveQualityController {
     return minMbps === Infinity ? 0 : minMbps;
   }
 
-  _stepDown(steps) {
+  _stepDown(steps, assessment) {
     const prevTier = this.tierIndex;
     this.tierIndex = Math.min(this.tiers.length - 1, this.tierIndex + steps);
     if (this.tierIndex !== prevTier) {
-      // Reset baselines since FPS target changed — prevents cross-tier confusion
       for (const [, health] of this.viewerHealth) {
         health.baselineSamples = 0;
         health.baselineFps = 0;
@@ -586,24 +812,34 @@ class AdaptiveQualityController {
       logger.warn('[ABR] DEGRADE tier ' + prevTier + '->' + this.tierIndex + ' (' + t.label + ') ' +
         (this.effectiveBitrate / 1e6).toFixed(1) + 'Mbps @' + this.effectiveFps + 'fps' +
         (t.scaleDown > 1 ? ' scale=' + t.scaleDown + 'x' : ''));
-      // Session log for ABR analysis
-      if (window.electron?.sessionLog) {
-        window.electron.sessionLog('abr-degrade', {
-          from: prevTier, to: this.tierIndex, label: t.label,
-          bitrateMbps: (this.effectiveBitrate / 1e6).toFixed(1),
-          fps: this.effectiveFps, scaleDown: t.scaleDown,
-        });
-      }
+      this._logSession('abr-degrade', {
+        from: prevTier,
+        to: this.tierIndex,
+        label: t.label,
+        bitrateMbps: (this.effectiveBitrate / 1e6).toFixed(1),
+        fps: this.effectiveFps,
+        scaleDown: t.scaleDown,
+        reason: assessment?.reason || null,
+        health: assessment?.state || null,
+        bottleneckViewerId: assessment?.bottleneckViewerId || null,
+      });
+      this._logSession('abr-decision', {
+        action: 'degrade',
+        from: prevTier,
+        to: this.tierIndex,
+        tier: t.label,
+        health: assessment?.state || null,
+        reason: assessment?.reason || null,
+      });
     }
     this.lastDegradeTime = Date.now();
     this.goodHealthStart = 0;
   }
 
-  _stepUp(steps) {
+  _stepUp(steps, assessment) {
     const prevTier = this.tierIndex;
     this.tierIndex = Math.max(0, this.tierIndex - steps);
     if (this.tierIndex !== prevTier) {
-      // Reset baselines since FPS target changed
       for (const [, health] of this.viewerHealth) {
         health.baselineSamples = 0;
         health.baselineFps = 0;
@@ -613,14 +849,23 @@ class AdaptiveQualityController {
       logger.info('[ABR] RECOVER tier ' + prevTier + '->' + this.tierIndex + ' (' + t.label + ') ' +
         (this.effectiveBitrate / 1e6).toFixed(1) + 'Mbps @' + this.effectiveFps + 'fps' +
         (t.scaleDown > 1 ? ' scale=' + t.scaleDown + 'x' : ''));
-      // Session log for ABR analysis
-      if (window.electron?.sessionLog) {
-        window.electron.sessionLog('abr-recover', {
-          from: prevTier, to: this.tierIndex, label: t.label,
-          bitrateMbps: (this.effectiveBitrate / 1e6).toFixed(1),
-          fps: this.effectiveFps, scaleDown: t.scaleDown,
-        });
-      }
+      this._logSession('abr-recover', {
+        from: prevTier,
+        to: this.tierIndex,
+        label: t.label,
+        bitrateMbps: (this.effectiveBitrate / 1e6).toFixed(1),
+        fps: this.effectiveFps,
+        scaleDown: t.scaleDown,
+        health: assessment?.state || 'good',
+      });
+      this._logSession('abr-decision', {
+        action: 'recover',
+        from: prevTier,
+        to: this.tierIndex,
+        tier: t.label,
+        health: assessment?.state || 'good',
+        reason: assessment?.reason || 'good-health',
+      });
     }
     this.lastRecoverTime = Date.now();
     this.goodHealthStart = 0;
@@ -641,6 +886,13 @@ class AdaptiveQualityController {
 
     sender.setParameters(params).catch(err => {
       logger.warn('[ABR] setParameters failed: ' + err.message);
+    });
+
+    this._logSession('abr-tier-applied', {
+      tier: tier.label,
+      bitrateMbps: Number((this.effectiveBitrate / 1e6).toFixed(2)),
+      fps: this.effectiveFps,
+      scaleDown: tier.scaleDown,
     });
   }
 
@@ -665,7 +917,6 @@ class LuminaApp {
       this.audioProducer = null;   // mediasoup Producer (audio)
       this.localStream = null;
       this.captureProfile = null;
-      this.selectedProfileKey = 'quality';
       this.includeAudio = true;
       this.isBroadcasting = false;
       this.luminaName = '';
@@ -681,8 +932,9 @@ class LuminaApp {
       this._nativeGameAudioNode = null;
       this._nativeGameAudioDestination = null;
       this._nativeGameAudioQueue = [];
+      this._captureDiagnosticsLogged = false;
+      this._lastCaptureTelemetry = null;
       this.abr = new AdaptiveQualityController(this);
-      this._bitrateCapMbps = null; // null = use profile default
 
       logger.info('LuminaApp initializing (SFU mode)...');
       this.attachEventListeners();
@@ -693,12 +945,102 @@ class LuminaApp {
     }
   }
 
+  _safeCloneMediaDict(dict) {
+    if (!dict || typeof dict !== 'object') return null;
+    const clone = {};
+    for (const [key, value] of Object.entries(dict)) {
+      if (value == null) continue;
+      if (typeof value === 'number') {
+        clone[key] = Number(value.toFixed ? value.toFixed(2) : value);
+      } else if (typeof value === 'string' || typeof value === 'boolean') {
+        clone[key] = value;
+      } else if (Array.isArray(value)) {
+        clone[key] = value.slice(0, 8);
+      }
+    }
+    return Object.keys(clone).length ? clone : null;
+  }
+
+  _logCaptureTrackDiagnostics(track, context = {}) {
+    if (!track || !window.electron?.sessionLog) return;
+
+    const payload = {
+      sourceId: context.sourceId || null,
+      sourceName: context.sourceName || null,
+      captureMethod: context.captureMethod || null,
+      requested: this._safeCloneMediaDict(context.requested || null),
+      settings: this._safeCloneMediaDict(track.getSettings?.() || null),
+      constraints: this._safeCloneMediaDict(track.getConstraints?.() || null),
+      capabilities: this._safeCloneMediaDict(track.getCapabilities?.() || null),
+      label: track.label || null,
+      readyState: track.readyState || null,
+      contentHint: track.contentHint || null,
+    };
+
+    logger.info('[DIAG:CAPTURE-TRACK] requested=' + JSON.stringify(payload.requested) +
+      ' settings=' + JSON.stringify(payload.settings) +
+      ' constraints=' + JSON.stringify(payload.constraints) +
+      (payload.capabilities ? ' capabilities=' + JSON.stringify(payload.capabilities) : ''));
+    window.electron.sessionLog('capture-track-diagnostics', payload);
+  }
+
+  _extractVideoPipelineStats(stats) {
+    const snapshot = {
+      outbound: null,
+      mediaSource: null,
+      track: null,
+      codec: null,
+      candidatePair: null,
+    };
+
+    stats.forEach((report) => {
+      if (report.type === 'outbound-rtp' && report.kind === 'video') {
+        snapshot.outbound = {
+          framesEncoded: report.framesEncoded ?? null,
+          frameWidth: report.frameWidth ?? null,
+          frameHeight: report.frameHeight ?? null,
+          qualityLimitationReason: report.qualityLimitationReason || null,
+          qualityLimitationDurations: report.qualityLimitationDurations || null,
+          qualityLimitationResolutionChanges: report.qualityLimitationResolutionChanges ?? null,
+          hugeFramesSent: report.hugeFramesSent ?? null,
+          pliCount: report.pliCount ?? null,
+          firCount: report.firCount ?? null,
+          nackCount: report.nackCount ?? null,
+          totalEncodeTime: report.totalEncodeTime ?? null,
+          totalPacketSendDelay: report.totalPacketSendDelay ?? null,
+          encoderImplementation: report.encoderImplementation || null,
+          powerEfficientEncoder: report.powerEfficientEncoder ?? null,
+          codecId: report.codecId || null,
+        };
+      } else if ((report.type === 'media-source' || report.type === 'track') && report.kind === 'video') {
+        const target = report.type === 'media-source' ? 'mediaSource' : 'track';
+        snapshot[target] = {
+          frames: report.frames ?? null,
+          framesPerSecond: report.framesPerSecond ?? null,
+          frameWidth: report.width ?? report.frameWidth ?? null,
+          frameHeight: report.height ?? report.frameHeight ?? null,
+        };
+      } else if (report.type === 'codec' && snapshot.outbound?.codecId && report.id === snapshot.outbound.codecId) {
+        snapshot.codec = {
+          mimeType: report.mimeType || null,
+          sdpFmtpLine: report.sdpFmtpLine || null,
+        };
+      } else if (report.type === 'candidate-pair' && report.nominated) {
+        snapshot.candidatePair = {
+          currentRoundTripTime: report.currentRoundTripTime ?? null,
+          availableOutgoingBitrate: report.availableOutgoingBitrate ?? null,
+        };
+      }
+    });
+
+    return snapshot;
+  }
+
   attachEventListeners() {
     const connectBtn = document.getElementById('connectBtn');
     const refreshBtn = document.getElementById('refreshSourcesBtn');
     const stopBtn = document.getElementById('stopStreamBtn');
     const clearLogsBtn = document.getElementById('toggleDebug');
-    const qualityProfile = document.getElementById('qualityProfile');
     const includeAudio = document.getElementById('includeAudio');
 
     if (connectBtn) connectBtn.addEventListener('click', () => this.connect());
@@ -706,28 +1048,7 @@ class LuminaApp {
     if (stopBtn) stopBtn.addEventListener('click', () => this.stopStreaming());
     if (clearLogsBtn) clearLogsBtn.addEventListener('click', () => logger.clear());
 
-    if (qualityProfile) {
-      qualityProfile.value = this.selectedProfileKey;
-      qualityProfile.addEventListener('change', () => this.setQualityProfile(qualityProfile.value));
-      this.refreshQualityProfileUi();
-    }
-
-    const bitrateSlider = document.getElementById('bitrateSlider');
-    const bitrateValue = document.getElementById('bitrateValue');
-    if (bitrateSlider) {
-      // Init from profile default
-      const defaultMbps = Math.round(this.getActiveQualityProfile().maxBitrate / 1_000_000);
-      bitrateSlider.value = defaultMbps;
-      if (bitrateValue) bitrateValue.textContent = defaultMbps + ' Mbps';
-
-      bitrateSlider.addEventListener('input', () => {
-        const mbps = parseInt(bitrateSlider.value, 10);
-        if (bitrateValue) bitrateValue.textContent = mbps + ' Mbps';
-        this._bitrateCapMbps = mbps;
-        this._updateProfileSummary();
-        logger.info('Bitrate cap set to ' + mbps + ' Mbps');
-      });
-    }
+    this.refreshQualityProfileUi();
 
     if (includeAudio) {
       includeAudio.checked = this.includeAudio;
@@ -739,49 +1060,10 @@ class LuminaApp {
   }
 
   getActiveQualityProfile() {
-    const base = QUALITY_PROFILES[this.selectedProfileKey] || QUALITY_PROFILES.quality;
-    if (this._bitrateCapMbps) {
-      return Object.assign({}, base, {
-        maxBitrate: this._bitrateCapMbps * 1_000_000,
-        summary: base.maxWidth + 'x' + base.maxHeight + ' / ' + base.maxFrameRate + ' fps / ' + this._bitrateCapMbps + ' Mbps cap',
-      });
-    }
-    return base;
-  }
-
-  _updateProfileSummary() {
-    const profile = this.getActiveQualityProfile();
-    const summary = document.getElementById('profileSummary');
-    if (summary) summary.textContent = profile.summary;
-  }
-
-  setQualityProfile(profileKey) {
-    if (!QUALITY_PROFILES[profileKey]) {
-      logger.warn('Unknown profile: ' + profileKey);
-      return;
-    }
-    this.selectedProfileKey = profileKey;
-
-    // Sync slider to new profile default if user hasn't manually set it yet
-    const slider = document.getElementById('bitrateSlider');
-    const valEl = document.getElementById('bitrateValue');
-    if (!this._bitrateCapMbps && slider) {
-      const defaultMbps = Math.round(QUALITY_PROFILES[profileKey].maxBitrate / 1_000_000);
-      slider.value = defaultMbps;
-      if (valEl) valEl.textContent = defaultMbps + ' Mbps';
-    }
-
-    this.refreshQualityProfileUi();
-    this._updateProfileSummary();
-    logger.info('Quality profile set to ' + QUALITY_PROFILES[profileKey].label);
-
-    // Update ABR — resets to max quality tier for the new profile
-    const prof = this.getActiveQualityProfile();
-    this.abr.setProfile(prof.maxBitrate, prof.maxFrameRate);
+    return SMOOTHNESS_PROFILE;
   }
 
   async updateProducerEncoding() {
-    // Delegate to ABR — resets to max quality tier for active profile
     const profile = this.getActiveQualityProfile();
     this.abr.setProfile(profile.maxBitrate, profile.maxFrameRate);
   }
@@ -897,6 +1179,9 @@ class LuminaApp {
         jitterMs: data.jitterMs,
         lossRate: data.lossRate || 0,
         bitrateMbps: data.bitrateMbps || 0,
+        droppedFramesDelta: data.droppedFramesDelta || 0,
+        jitterBufferDelayMs: data.jitterBufferDelayMs || 0,
+        decodeLatencyMs: data.decodeLatencyMs || 0,
       });
 
       if (!this._qrLogCounter) this._qrLogCounter = 0;
@@ -904,7 +1189,7 @@ class LuminaApp {
       if (this._qrLogCounter % 5 === 0) {
         const viewer = this.viewers.get(data.viewerId);
         const name = viewer ? viewer.name : data.viewerId;
-        logger.debug('[DIAG:QR] ' + name + ' | fps=' + data.fps + ' bitrate=' + data.bitrateMbps + 'Mbps res=' + data.frameWidth + 'x' + data.frameHeight + ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms [ABR:' + this.abr.getStatusText() + ']');
+        logger.debug('[DIAG:QR] ' + name + ' | fps=' + data.fps + ' bitrate=' + data.bitrateMbps + 'Mbps res=' + data.frameWidth + 'x' + data.frameHeight + ' jitter=' + (data.jitterMs != null ? data.jitterMs : '--') + 'ms drops=' + (data.droppedFramesDelta || 0) + ' decode=' + (data.decodeLatencyMs != null ? data.decodeLatencyMs : '--') + 'ms [ABR:' + this.abr.getStatusText() + ']');
       }
     });
 
@@ -916,7 +1201,7 @@ class LuminaApp {
       this._bweLogCounter++;
       if (this._bweLogCounter % 2 === 0) {
         const agg = data.aggregate;
-        logger.debug('[BWE] rtt=' + (agg.worstRttMs || '--') + 'ms nack=' + ((agg.worstNackRate || 0) * 100).toFixed(1) + '% score=' + (agg.minScore != null ? agg.minScore : '--') + ' avail=' + (agg.minAvailableMbps != null ? agg.minAvailableMbps.toFixed(1) : '--') + 'Mbps del=' + (agg.minDeliveryMbps != null ? agg.minDeliveryMbps.toFixed(1) : '--') + 'Mbps');
+        logger.debug('[BWE] rtt=' + (agg.worstRttMs || '--') + 'ms nack=' + ((agg.worstNackRate || 0) * 100).toFixed(1) + '% score=' + (agg.minScore != null ? agg.minScore : '--') + ' avail=' + (agg.minAvailableMbps != null ? agg.minAvailableMbps.toFixed(1) : '--') + 'Mbps del=' + (agg.minDeliveryMbps != null ? agg.minDeliveryMbps.toFixed(1) : '--') + 'Mbps spread=' + (agg.viewerSpreadMbps != null ? agg.viewerSpreadMbps.toFixed(1) : '--') + 'Mbps bottleneck=' + (agg.bottleneckViewerName || '--'));
       }
     });
   }
@@ -1012,7 +1297,15 @@ class LuminaApp {
           '<button class="btn btn-small">Stream This</button>';
         sourceEl.querySelector('button').addEventListener('click', () => {
           logger.info('Selected: ' + source.name + (source.isGame ? ' [GAME]' : ''));
-          this.startStreaming(source.id, source.name, source.isGame, source.gameHwnd, source.gamePid);
+          this.startStreaming(
+            source.id,
+            source.name,
+            source.isGame,
+            source.gameHwnd,
+            source.gamePid,
+            source.gameProcess,
+            source.classificationReason
+          );
         });
         grid.appendChild(sourceEl);
       });
@@ -1021,8 +1314,16 @@ class LuminaApp {
     }
   }
 
-  async startStreaming(sourceId, sourceName, isGame = false, gameHwnd = null, gamePid = null) {
+  async startStreaming(sourceId, sourceName, isGame = false, gameHwnd = null, gamePid = null, gameProcess = null, classificationReason = null) {
     try {
+      const inferredKnownGame = !isGame ? inferKnownGameFromTitle(sourceName) : null;
+      if (!isGame && inferredKnownGame) {
+        isGame = true;
+        gameProcess = gameProcess || inferredKnownGame.processName;
+        classificationReason = classificationReason || 'runtime-known-game-title-match';
+        logger.warn('[GAME] Promoting likely game window to GAME MODE via title heuristic: ' + sourceName);
+      }
+
       logger.info('Starting stream: ' + sourceName + (isGame ? ' [GAME MODE]' : ''));
 
       this._isGameCapture = isGame;
@@ -1084,7 +1385,7 @@ class LuminaApp {
             scaleResolutionDownBy: 1.0,
           }],
           codecOptions: {
-            videoGoogleStartBitrate: 10000,
+            videoGoogleStartBitrate: Math.round(prof.startBitrate / 1000),
           },
         });
 
@@ -1171,7 +1472,7 @@ class LuminaApp {
 
       if (window.electron?.sessionLog) {
         window.electron.sessionLog('stream-start', {
-          sourceId, sourceName, isGame, gameHwnd, gamePid,
+          sourceId, sourceName, isGame, gameHwnd, gamePid, gameProcess, classificationReason,
           profile: this.captureProfile,
           captureMethod: this._gameUsedScreenFallback ? 'screen-dxgi' : (sourceId.startsWith('window:') ? 'window-wgc' : 'screen'),
         });
@@ -1201,17 +1502,28 @@ class LuminaApp {
     // DirectX/Vulkan game surfaces.
 
     const videoConstraints = { mandatory };
+    const captureMethod = sourceId.startsWith('screen:') ? 'screen-dxgi' : 'window-wgc';
 
     if (!allowAudioCapture) {
       if (this.includeAudio && this._isGameCapture) {
         logger.info('[GAME] Desktop audio capture disabled — native process-loopback will provide game-only audio');
       }
-      return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+      const track = stream.getVideoTracks()[0];
+      if (track) {
+        this._logCaptureTrackDiagnostics(track, {
+          sourceId,
+          sourceName: this._lastSelectedSourceName || null,
+          captureMethod,
+          requested: mandatory,
+        });
+      }
+      return stream;
     }
 
     try {
       logger.info('Attempting audio + video capture');
-      return await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           mandatory: {
             chromeMediaSource: 'desktop',
@@ -1220,9 +1532,29 @@ class LuminaApp {
         },
         video: videoConstraints
       });
+      const track = stream.getVideoTracks()[0];
+      if (track) {
+        this._logCaptureTrackDiagnostics(track, {
+          sourceId,
+          sourceName: this._lastSelectedSourceName || null,
+          captureMethod,
+          requested: mandatory,
+        });
+      }
+      return stream;
     } catch (error) {
       logger.warn('Audio capture failed, falling back to video-only: ' + error.message);
-      return navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+      const track = stream.getVideoTracks()[0];
+      if (track) {
+        this._logCaptureTrackDiagnostics(track, {
+          sourceId,
+          sourceName: this._lastSelectedSourceName || null,
+          captureMethod,
+          requested: mandatory,
+        });
+      }
+      return stream;
     }
   }
 
@@ -1241,6 +1573,7 @@ class LuminaApp {
       }
       return screens[0].id;
     } catch (e) {
+        this._lastSelectedSourceName = sourceName;
       logger.warn('[GAME] Screen source lookup failed: ' + e.message);
       return null;
     }
@@ -1259,6 +1592,7 @@ class LuminaApp {
         const stats = await this.videoProducer.getStats();
         let bitrateMbps = null;
         let fps = null;
+        const pipelineStats = this._extractVideoPipelineStats(stats);
 
         stats.forEach((report) => {
           if (report.type === 'outbound-rtp' && report.kind === 'video') {
@@ -1281,6 +1615,9 @@ class LuminaApp {
         });
 
         this.updateStatsDisplay(bitrateMbps, fps);
+        if (bitrateMbps !== null || fps !== null) {
+          this.abr.updateProducerStats({ bitrateMbps, fps });
+        }
 
         // Periodic stats snapshot (every 5s)
         if (bitrateMbps !== null && window.electron?.sessionLog) {
@@ -1292,6 +1629,23 @@ class LuminaApp {
               abrLabel: this.abr.tiers?.[this.abr.tierIndex]?.label,
               viewers: this.viewers.size,
             };
+            if (pipelineStats.mediaSource || pipelineStats.track || pipelineStats.outbound) {
+              snapshot.capture = {
+                sourceFps: pipelineStats.mediaSource?.framesPerSecond ?? pipelineStats.track?.framesPerSecond ?? null,
+                sourceWidth: pipelineStats.mediaSource?.frameWidth ?? pipelineStats.track?.frameWidth ?? null,
+                sourceHeight: pipelineStats.mediaSource?.frameHeight ?? pipelineStats.track?.frameHeight ?? null,
+                outboundWidth: pipelineStats.outbound?.frameWidth ?? null,
+                outboundHeight: pipelineStats.outbound?.frameHeight ?? null,
+                qualityLimitationReason: pipelineStats.outbound?.qualityLimitationReason ?? null,
+                qualityLimitationResolutionChanges: pipelineStats.outbound?.qualityLimitationResolutionChanges ?? null,
+                encoderImplementation: pipelineStats.outbound?.encoderImplementation ?? null,
+                powerEfficientEncoder: pipelineStats.outbound?.powerEfficientEncoder ?? null,
+                codec: pipelineStats.codec?.mimeType ?? null,
+                availableOutgoingBitrateMbps: pipelineStats.candidatePair?.availableOutgoingBitrate != null
+                  ? +(pipelineStats.candidatePair.availableOutgoingBitrate / 1000000).toFixed(2)
+                  : null,
+              };
+            }
             // Include server BWE metrics if available
             const bwe = this.abr._serverBwe;
             const bweAge = Date.now() - this.abr._serverBweTime;
@@ -1302,8 +1656,20 @@ class LuminaApp {
                 score: bwe.aggregate.minScore,
                 availableMbps: bwe.aggregate.minAvailableMbps,
                 deliveryMbps: bwe.aggregate.minDeliveryMbps,
+                spreadMbps: bwe.aggregate.viewerSpreadMbps,
+                bottleneckViewerId: bwe.aggregate.bottleneckViewerId,
               };
             }
+            snapshot.encoder = {
+              stallSeconds: this.abr._producerStats.stallSeconds,
+            };
+            const captureSummary = snapshot.capture
+              ? ' capture=' + (snapshot.capture.sourceWidth || '--') + 'x' + (snapshot.capture.sourceHeight || '--') +
+                '@' + (snapshot.capture.sourceFps || '--') +
+                ' out=' + (snapshot.capture.outboundWidth || '--') + 'x' + (snapshot.capture.outboundHeight || '--') +
+                ' qlim=' + (snapshot.capture.qualityLimitationReason || 'none')
+              : '';
+            logger.info('[DIAG:PIPELINE] enc=' + fps + 'fps ' + bitrateMbps.toFixed(2) + 'Mbps' + captureSummary);
             window.electron.sessionLog('stats-snapshot', snapshot);
           }
         }
@@ -1351,6 +1717,13 @@ class LuminaApp {
           this._healthStalls++;
           if (this._healthStalls >= 2) {
             logger.warn('[HEALTH] No new frames for ~' + this._healthStalls + 's — re-acquiring source');
+            this._sourceStallStartedAt = this._sourceStallStartedAt || Date.now();
+            if (this._healthStalls === 2) {
+              this.abr._logSession('source-stall-detected', {
+                stallSeconds: this._healthStalls,
+                tier: this.abr.currentTier.label,
+              });
+            }
             await this._reacquireCaptureSource();
             this._healthStalls = 0;
           }
@@ -1390,8 +1763,21 @@ class LuminaApp {
         this.localStream.getVideoTracks().forEach(t => t.stop());
       }
       this.localStream = newStream;
+      this._logCaptureTrackDiagnostics(newTrack, {
+        sourceId,
+        sourceName: this._lastSelectedSourceName || null,
+        captureMethod: sourceId.startsWith('screen:') ? 'screen-dxgi' : 'window-wgc',
+        requested: this.getActiveQualityProfile(),
+      });
 
       logger.info('[HEALTH] Capture source re-acquired successfully');
+      if (this._sourceStallStartedAt) {
+        this.abr._logSession('source-stall-recovered', {
+          recoveryMs: Date.now() - this._sourceStallStartedAt,
+          sourceId,
+        });
+        this._sourceStallStartedAt = 0;
+      }
     } catch (e) {
       logger.warn('[HEALTH] Re-acquire failed: ' + e.message);
     }
@@ -1470,6 +1856,12 @@ class LuminaApp {
       this.localStream = screenStream;
       this._lastSourceId = screenId;
       this._gameUsedScreenFallback = true;
+      this._logCaptureTrackDiagnostics(newTrack, {
+        sourceId: screenId,
+        sourceName: this._lastSelectedSourceName || null,
+        captureMethod: 'screen-dxgi',
+        requested: this.getActiveQualityProfile(),
+      });
 
       logger.info('[GAME] Switched to screen capture (DXGI) — game in exclusive fullscreen. Audio stays on process loopback.');
       if (window.electron?.sessionLog) {

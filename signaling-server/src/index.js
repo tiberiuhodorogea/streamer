@@ -43,7 +43,9 @@ const sessionStats = {
   totalLuminaRegistrations: 0,
   peakViewerCount: 0,
   qualityReportSamples: [],   // last N for summary
+  bweSamples: [],
   abrEvents: [],               // ABR tier changes
+  bottleneckChanges: 0,
   transportIssues: [],          // DTLS failures, transport errors
   startedAt: sessionStartedAt.toISOString(),
   endedAt: null,
@@ -97,9 +99,26 @@ function writeSessionSummary() {
     };
   }
 
+  if (sessionStats.bweSamples.length > 0) {
+    const samples = sessionStats.bweSamples;
+    const avgWorstRttMs = samples.reduce((a, b) => a + (b.worstRttMs || 0), 0) / samples.length;
+    const avgWorstNackRate = samples.reduce((a, b) => a + (b.worstNackRate || 0), 0) / samples.length;
+    const avgMedianDeliveryMbps = samples.reduce((a, b) => a + (b.medianDeliveryMbps || 0), 0) / samples.length;
+    const avgViewerSpreadMbps = samples.reduce((a, b) => a + (b.viewerSpreadMbps || 0), 0) / samples.length;
+    sessionStats.bweAggregate = {
+      sampleCount: samples.length,
+      avgWorstRttMs: Number(avgWorstRttMs.toFixed(1)),
+      avgWorstNackRate: Number(avgWorstNackRate.toFixed(4)),
+      avgMedianDeliveryMbps: Number(avgMedianDeliveryMbps.toFixed(2)),
+      avgViewerSpreadMbps: Number(avgViewerSpreadMbps.toFixed(2)),
+      bottleneckChanges: sessionStats.bottleneckChanges,
+    };
+  }
+
   // Don't write the raw samples array to the summary (too large)
   const summary = { ...sessionStats };
   delete summary.qualityReportSamples;
+  delete summary.bweSamples;
 
   const summaryPath = path.join(sessionDir, 'session.summary.json');
   fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
@@ -123,7 +142,56 @@ const config = {
 };
 
 // Server-side BWE polling interval (ms)
-const BWE_POLL_INTERVAL_MS = 2000;
+const BWE_POLL_INTERVAL_MS = 1000;
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+  return sorted[mid];
+}
+
+function extractTransportMetrics(stats) {
+  let rttMs = null;
+  let availableBitrateMbps = null;
+
+  stats.forEach((report) => {
+    if (report.type === 'webrtc-transport' || report.type === 'transport') {
+      const rawRtt = report.iceSelectedTuple?.rtt ?? report.roundTripTime ?? null;
+      if (rawRtt != null) {
+        const candidateRttMs = rawRtt > 100 ? rawRtt : rawRtt * 1000;
+        if (Number.isFinite(candidateRttMs)) {
+          rttMs = Number(candidateRttMs.toFixed(1));
+        }
+      }
+
+      const rawBitrate = report.availableOutgoingBitrate ?? report.currentAvailableOutgoingBitrate ?? null;
+      if (rawBitrate != null && Number.isFinite(rawBitrate)) {
+        availableBitrateMbps = Number((rawBitrate / 1_000_000).toFixed(2));
+      }
+    }
+
+    if (report.type === 'candidate-pair' && (report.nominated || report.selected) && report.state === 'succeeded') {
+      if (report.currentRoundTripTime != null) {
+        const candidateRttMs = report.currentRoundTripTime > 100 ? report.currentRoundTripTime : report.currentRoundTripTime * 1000;
+        if (Number.isFinite(candidateRttMs)) {
+          rttMs = Number(candidateRttMs.toFixed(1));
+        }
+      }
+      const rawBitrate = report.availableOutgoingBitrate ?? report.currentAvailableOutgoingBitrate ?? null;
+      if (rawBitrate != null && Number.isFinite(rawBitrate)) {
+        availableBitrateMbps = Number((rawBitrate / 1_000_000).toFixed(2));
+      }
+    }
+  });
+
+  if (rttMs != null && rttMs > 10000) rttMs = null;
+
+  return { rttMs, availableBitrateMbps };
+}
 
 const MEDIA_CODECS = [
   {
@@ -517,6 +585,7 @@ async function handleViewerJoin(clientId, data, ws) {
     name: viewerName,
     consumerTransport: null,
     consumers: new Map(),
+    latestQualityReport: null,
   });
 
   send(room.streamer.ws, 'viewer-joined', { viewerId: clientId, viewerName });
@@ -680,6 +749,8 @@ function startBwePolling(roomId) {
 
   // Per-viewer state for delta calculations
   const viewerPrev = new Map();
+  let lastBottleneckViewerId = null;
+  let bottleneckStreak = 0;
 
   const interval = setInterval(async () => {
     const room = rooms.get(roomId);
@@ -702,10 +773,14 @@ function startBwePolling(roomId) {
       try {
         const stats = await videoConsumer.getStats();
         let outbound = null;
+        let remoteInbound = null;
 
         stats.forEach(report => {
           if (report.type === 'outbound-rtp' && report.kind === 'video') {
             outbound = report;
+          }
+          if (report.type === 'remote-inbound-rtp' && report.kind === 'video') {
+            remoteInbound = report;
           }
         });
 
@@ -722,16 +797,22 @@ function startBwePolling(roomId) {
           const bytesDelta = (outbound.bytesSent || 0) - (prev.bytesSent || 0);
           deliveryMbps = (bytesDelta * 8) / elapsed / 1_000_000;
 
-          const nackDelta = (outbound.nackCount || 0) - (prev.nackCount || 0);
+          const nackDelta = (outbound.nackCount || remoteInbound?.nackCount || 0) - (prev.nackCount || 0);
           const packetsDelta = (outbound.packetsSent || 0) - (prev.packetsSent || 0);
           nackRate = packetsDelta > 0 ? nackDelta / packetsDelta : 0;
+        }
+
+        const latestQualityReport = viewer.latestQualityReport || null;
+        const reportIsFresh = latestQualityReport && (Date.now() - latestQualityReport.at) <= (BWE_POLL_INTERVAL_MS * 3);
+        if ((deliveryMbps <= 0 || !Number.isFinite(deliveryMbps)) && reportIsFresh && latestQualityReport.bitrateMbps > 0) {
+          deliveryMbps = latestQualityReport.bitrateMbps;
         }
 
         // Save for next delta
         viewerPrev.set(viewerId, {
           timestamp: now,
           bytesSent: outbound.bytesSent || 0,
-          nackCount: outbound.nackCount || 0,
+          nackCount: outbound.nackCount || remoteInbound?.nackCount || 0,
           packetsSent: outbound.packetsSent || 0,
           pliCount: outbound.pliCount || 0,
           firCount: outbound.firCount || 0,
@@ -745,36 +826,30 @@ function startBwePolling(roomId) {
         // Transport-level stats: RTT (from DTLS/ICE) and available bitrate
         // NOTE: consumer outbound-rtp stats do NOT have roundTripTime in mediasoup.
         // RTT must come from the transport's own stats.
-        let rttMs = null;
+        let rttMs = remoteInbound?.roundTripTime != null
+          ? Number(((remoteInbound.roundTripTime > 100 ? remoteInbound.roundTripTime : remoteInbound.roundTripTime * 1000)).toFixed(1))
+          : null;
         let availableBitrateMbps = null;
         if (viewer.consumerTransport) {
           try {
             const tStats = await viewer.consumerTransport.getStats();
-            tStats.forEach(r => {
-              if (r.type === 'webrtc-transport') {
-                // mediasoup transport stats expose iceSelectedTuple RTT
-                if (r.iceSelectedTuple?.rtt != null) {
-                  rttMs = Number(r.iceSelectedTuple.rtt.toFixed(1));
-                }
-                if (r.availableOutgoingBitrate != null) {
-                  availableBitrateMbps = Number((r.availableOutgoingBitrate / 1_000_000).toFixed(2));
-                }
-              }
-            });
+            const transportMetrics = extractTransportMetrics(tStats);
+            rttMs = rttMs ?? transportMetrics.rttMs;
+            availableBitrateMbps = transportMetrics.availableBitrateMbps;
           } catch {}
-          // Sanity: discard RTT values > 10s (clearly invalid)
-          if (rttMs != null && rttMs > 10000) rttMs = null;
         }
 
         viewerBwe[viewerId] = {
           deliveryMbps: Number(deliveryMbps.toFixed(2)),
           rttMs,
           nackRate: Number(nackRate.toFixed(4)),
-          pliCount: outbound.pliCount || 0,
-          firCount: outbound.firCount || 0,
+          pliCount: outbound.pliCount || remoteInbound?.pliCount || 0,
+          firCount: outbound.firCount || remoteInbound?.firCount || 0,
           score,
           producerScore,
           availableBitrateMbps,
+          viewerName: viewer.name,
+          latestQualityReport,
         };
         hasData = true;
 
@@ -791,6 +866,11 @@ function startBwePolling(roomId) {
     let minScore = 10;
     let minAvailableMbps = Infinity;
     let minDeliveryMbps = Infinity;
+    let maxDeliveryMbps = 0;
+    let bottleneckScore = Infinity;
+    let bottleneckViewerId = null;
+    let lowHeadroomViewers = 0;
+    const deliverySamples = [];
 
     for (const vId of Object.keys(viewerBwe)) {
       const v = viewerBwe[vId];
@@ -801,6 +881,44 @@ function startBwePolling(roomId) {
         minAvailableMbps = v.availableBitrateMbps;
       }
       if (v.deliveryMbps < minDeliveryMbps) minDeliveryMbps = v.deliveryMbps;
+      if (v.deliveryMbps > maxDeliveryMbps) maxDeliveryMbps = v.deliveryMbps;
+      deliverySamples.push(v.deliveryMbps);
+
+      const quality = v.latestQualityReport || {};
+      const healthScore =
+        (quality.fps || 0) -
+        ((quality.jitterMs || 0) / 20) -
+        ((quality.lossRate || 0) * 140) -
+        (v.nackRate * 100) -
+        ((v.rttMs || 0) / 60) +
+        (v.deliveryMbps * 2);
+
+      if ((v.availableBitrateMbps != null && v.availableBitrateMbps < 8) || v.deliveryMbps < 5) {
+        lowHeadroomViewers++;
+      }
+
+      if (healthScore < bottleneckScore) {
+        bottleneckScore = healthScore;
+        bottleneckViewerId = vId;
+      }
+    }
+
+    if (bottleneckViewerId) {
+      if (bottleneckViewerId === lastBottleneckViewerId) {
+        bottleneckStreak++;
+      } else {
+        if (lastBottleneckViewerId) {
+          sessionStats.bottleneckChanges++;
+          appendSessionLog('bwe-bottleneck', {
+            roomId,
+            previousViewerId: lastBottleneckViewerId,
+            viewerId: bottleneckViewerId,
+            viewerName: viewerBwe[bottleneckViewerId]?.viewerName || null,
+          });
+        }
+        bottleneckStreak = 1;
+        lastBottleneckViewerId = bottleneckViewerId;
+      }
     }
 
     const bweEvent = {
@@ -811,6 +929,14 @@ function startBwePolling(roomId) {
         minScore: minScore === 10 ? null : minScore,
         minAvailableMbps: minAvailableMbps === Infinity ? null : minAvailableMbps,
         minDeliveryMbps: minDeliveryMbps === Infinity ? null : minDeliveryMbps,
+        medianDeliveryMbps: deliverySamples.length ? Number(median(deliverySamples).toFixed(2)) : null,
+        maxDeliveryMbps: Number(maxDeliveryMbps.toFixed(2)),
+        viewerSpreadMbps: deliverySamples.length ? Number((maxDeliveryMbps - minDeliveryMbps).toFixed(2)) : null,
+        lowHeadroomViewers,
+        bottleneckViewerId,
+        bottleneckViewerName: bottleneckViewerId ? (viewerBwe[bottleneckViewerId]?.viewerName || null) : null,
+        bottleneckStreak,
+        bottleneckScore: bottleneckScore === Infinity ? null : Number(bottleneckScore.toFixed(2)),
       },
     };
 
@@ -819,6 +945,10 @@ function startBwePolling(roomId) {
 
     // Log BWE snapshot
     appendSessionLog('server-bwe', bweEvent);
+    sessionStats.bweSamples.push(bweEvent.aggregate);
+    if (sessionStats.bweSamples.length > 10000) {
+      sessionStats.bweSamples.splice(0, sessionStats.bweSamples.length - 10000);
+    }
   }, BWE_POLL_INTERVAL_MS);
 
   bweIntervals.set(roomId, interval);
@@ -843,6 +973,7 @@ function handleViewerQualityReport(clientId, data) {
   const client = clients.get(clientId);
   const room = rooms.get(client?.roomId);
   if (!room) return;
+  const viewer = room.viewers.get(clientId);
 
   // Drop stale reports (fps=0 means stream ended for this viewer)
   if (data.fps === 0) {
@@ -871,7 +1002,23 @@ function handleViewerQualityReport(clientId, data) {
     frameHeight: data.frameHeight,
     jitterMs: data.jitterMs,
     lossRate: data.lossRate,
+    droppedFramesDelta: data.droppedFramesDelta,
+    jitterBufferDelayMs: data.jitterBufferDelayMs,
+    decodeLatencyMs: data.decodeLatencyMs,
   });
+
+  if (viewer) {
+    viewer.latestQualityReport = {
+      fps: data.fps,
+      bitrateMbps: data.bitrateMbps,
+      jitterMs: data.jitterMs,
+      lossRate: data.lossRate,
+      droppedFramesDelta: data.droppedFramesDelta || 0,
+      jitterBufferDelayMs: data.jitterBufferDelayMs || null,
+      decodeLatencyMs: data.decodeLatencyMs || null,
+      at: Date.now(),
+    };
+  }
 
   // Track for session summary
   sessionStats.totalQualityReports++;
@@ -882,6 +1029,9 @@ function handleViewerQualityReport(clientId, data) {
     frameHeight: data.frameHeight,
     jitterMs: data.jitterMs,
     lossRate: data.lossRate,
+    droppedFramesDelta: data.droppedFramesDelta,
+    jitterBufferDelayMs: data.jitterBufferDelayMs,
+    decodeLatencyMs: data.decodeLatencyMs,
   });
   // Keep last 10000 samples max
   if (sessionStats.qualityReportSamples.length > 10000) {
@@ -896,6 +1046,9 @@ function handleViewerQualityReport(clientId, data) {
     frameHeight: data.frameHeight,
     jitterMs: data.jitterMs,
     lossRate: data.lossRate,
+    droppedFramesDelta: data.droppedFramesDelta,
+    jitterBufferDelayMs: data.jitterBufferDelayMs,
+    decodeLatencyMs: data.decodeLatencyMs,
   });
 }
 

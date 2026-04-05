@@ -95,6 +95,20 @@ const WELL_KNOWN_NON_GAMES = [
   'runtimebroker', 'sihost', 'widgets', 'phonelinkserver',
 ];
 
+const KNOWN_GAME_ALIASES = [
+  {
+    canonical: 'deadbydaylight',
+    processName: 'DeadByDaylight-Win64-Shipping',
+    aliases: [
+      'deadbydaylight',
+      'dead by daylight',
+      'deadbydaylightwin64shipping',
+      'deadbydaylightwin64',
+      'deadbydaylightshipping',
+    ],
+  },
+];
+
 /**
  * Detects windows belonging to game processes by checking loaded DirectX/Vulkan modules.
  * Returns Map<hwndString, { name, pid }>.
@@ -156,6 +170,97 @@ function detectGameHwnds() {
     console.error('[GAME-DETECT] PowerShell error:', err.message);
     return new Map();
   }
+}
+
+function normalizeCaptureName(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function stripGameSuffixes(name) {
+  return normalizeCaptureName(name)
+    .replace(/win64shipping|win32shipping|shipping|launcher|bootstrapper|exe|x64|x86/g, '');
+}
+
+function findKnownGameAlias(name) {
+  const sourceKey = normalizeCaptureName(name);
+  const sourceBase = stripGameSuffixes(name);
+  if (!sourceKey && !sourceBase) return null;
+
+  for (const entry of KNOWN_GAME_ALIASES) {
+    for (const alias of entry.aliases) {
+      const aliasKey = normalizeCaptureName(alias);
+      const aliasBase = stripGameSuffixes(alias);
+      if (!aliasKey && !aliasBase) continue;
+      if (sourceKey === aliasKey || sourceBase === aliasBase) return entry;
+      if (aliasBase && (sourceKey.includes(aliasBase) || sourceBase.includes(aliasBase))) return entry;
+      if (sourceBase && (aliasKey.includes(sourceBase) || aliasBase.includes(sourceBase))) return entry;
+    }
+  }
+
+  return null;
+}
+
+function findLikelyGameProcessForSource(sourceName, gameHwnds) {
+  const sourceKey = normalizeCaptureName(sourceName);
+  const sourceBase = stripGameSuffixes(sourceName);
+  if (!sourceKey) return null;
+
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (const item of gameHwnds.values()) {
+    const processKey = normalizeCaptureName(item.name);
+    const processBase = stripGameSuffixes(item.name);
+    if (!processKey) continue;
+
+    let score = 0;
+    if (sourceKey === processKey || sourceBase === processBase) score = 100;
+    else if (sourceKey.includes(processBase) || processBase.includes(sourceKey)) score = 90;
+    else if (sourceBase && (sourceKey.includes(sourceBase) || sourceBase.includes(sourceKey))) score = 80;
+    else if (processBase && (sourceBase.includes(processBase) || processBase.includes(sourceBase))) score = 70;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = item;
+    }
+  }
+
+  return bestScore >= 70 ? bestMatch : null;
+}
+
+function classifyCaptureSource(source, gameHwnds) {
+  const hwndMatch = source.id.match(/^window:(\d+):/);
+  const hwnd = hwndMatch ? hwndMatch[1] : null;
+  const directGameProcess = hwnd ? (gameHwnds.get(hwnd) || null) : null;
+  const fuzzyGameProcess = !directGameProcess && source.id.startsWith('window:')
+    ? findLikelyGameProcessForSource(source.name, gameHwnds)
+    : null;
+  const knownGameAlias = !directGameProcess && !fuzzyGameProcess && source.id.startsWith('window:')
+    ? findKnownGameAlias(source.name)
+    : null;
+  const gameProcess = directGameProcess || fuzzyGameProcess || (knownGameAlias
+    ? { name: knownGameAlias.processName, pid: null }
+    : null);
+
+  let classificationReason = 'not-game';
+  if (directGameProcess) classificationReason = 'direct-hwnd-match';
+  else if (fuzzyGameProcess) classificationReason = 'title-process-fuzzy-match';
+  else if (knownGameAlias) classificationReason = 'known-game-title-match';
+  else if (!source.id.startsWith('window:')) classificationReason = 'screen-source';
+
+  return {
+    id: source.id,
+    name: source.name,
+    kind: source.id.startsWith('window:') ? 'window' : 'screen',
+    thumbnail: source.thumbnail.toDataURL(),
+    isGame: !!gameProcess,
+    gameProcess: gameProcess ? gameProcess.name : null,
+    gamePid: gameProcess ? gameProcess.pid : null,
+    gameHwnd: directGameProcess && hwnd ? parseInt(hwnd, 10) : null,
+    classificationReason,
+  };
 }
 
 const createWindow = () => {
@@ -226,24 +331,27 @@ ipcMain.handle('get-capture-sources', async () => {
       console.warn('[GAME-DETECT] Detection skipped:', e.message);
     }
 
-    return sources
+    const classifiedSources = sources
       .filter(source => !APP_CAPTURE_NAMES.has(source.name))
-      .map(source => {
-        const hwndMatch = source.id.match(/^window:(\d+):/);
-        const hwnd = hwndMatch ? hwndMatch[1] : null;
-        const gameProcess = hwnd ? (gameHwnds.get(hwnd) || null) : null;
+      .map(source => classifyCaptureSource(source, gameHwnds));
 
-        return {
-          id: source.id,
-          name: source.name,
-          kind: source.id.startsWith('window:') ? 'window' : 'screen',
-          thumbnail: source.thumbnail.toDataURL(),
-          isGame: !!gameProcess,
-          gameProcess: gameProcess ? gameProcess.name : null,
-          gamePid: gameProcess ? gameProcess.pid : null,
-          gameHwnd: gameProcess && hwnd ? parseInt(hwnd) : null,
-        };
-      });
+    appendLuminaLog('capture-sources-enumerated', {
+      sources: classifiedSources.map(source => ({
+        name: source.name,
+        kind: source.kind,
+        isGame: source.isGame,
+        matchedProcess: source.gameProcess,
+        classificationReason: source.classificationReason,
+      })),
+    });
+
+    for (const source of classifiedSources) {
+      console.log('[SOURCE] ' + source.kind + ' | ' + source.name + ' | isGame=' + source.isGame +
+        ' | matchedProcess=' + (source.gameProcess || 'none') +
+        ' | reason=' + source.classificationReason);
+    }
+
+    return classifiedSources;
   } catch (error) {
     console.error('Error getting capture sources:', error);
     return [];

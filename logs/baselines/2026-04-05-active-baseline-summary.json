@@ -1,26 +1,38 @@
 {
-  "label": "Active baseline after native handoff tuning",
+  "label": "Post-simplification: sender-stress removed, viewer-only ABR triggers",
   "date": "2026-04-05",
-  "commit": "677fc60",
-  "sessionDir": "2026-04-05T08-03-00-284Z-677fc60",
-  "sessionDurationSec": 203.7,
+  "commit": "6571907",
+  "sessionDir": "2026-04-05T09-24-36-276Z-6571907",
+  "sessionDurationSec": 235.5,
   "refreshRequiredCount": 0,
   "viewerBuildId": "viewer-sfu-3",
+  "abrEvents": { "degrades": 0, "recovers": 1 },
+  "tierDistribution": {
+    "FULL": { "snapshots": 42, "pct": 91.3 },
+    "FLOW": { "snapshots": 4, "pct": 8.7 }
+  },
   "streamer": {
-    "bitrateMbps": { "avg": 9.47, "min": 1.23, "max": 12.64 },
-    "fps": { "avg": 54.45, "min": 41, "max": 60 }
+    "bitrateMbps": { "avg": 10.3, "min": 1.27, "max": 12.81 },
+    "fps": { "avg": 53.1, "min": 38, "max": 60 },
+    "sourceFps": { "avg": 53.5, "min": 38, "max": 61 },
+    "bweAvailableMbps": { "avg": 14.76, "min": 5.48, "max": 17.41 }
   },
   "viewer": {
-    "bitrateMbps": { "avg": 9.64, "min": 0.91, "max": 13.93 },
-    "fps": { "avg": 53.68, "min": 6, "max": 65 },
-    "jitterBufferDelayMs": { "avg": 40.51, "min": 13.9, "max": 57.2 },
-    "decodeLatencyMs": { "avg": 5.16, "min": 3.2, "max": 5.9 }
+    "fps": { "avg": 53.0, "min": 0, "max": 71, "p5": 43, "p95": 58 },
+    "jitterBufferDelayMs": { "avg": 46.9, "min": 39.3, "max": 64.7 },
+    "decodeLatencyMs": { "avg": 6.7, "min": 2.5, "max": 8.1 },
+    "playoutDriftMs": { "avg": 993.5 },
+    "slowdowns_pct": 2.2,
+    "speedups_pct": 0.9,
+    "droppedFrames": 0,
+    "lossRate": 0.0004
   },
   "notes": [
-    "This session is the retained comparison point for the next tuning loop.",
-    "Startup stayed low-latency and the stream recovered from FLOW to FULL without any viewer refresh.",
-    "Viewer jitter buffer averaged about 40.5 ms, materially lower than the earlier 06:20 and 07:35 retained comparisons.",
-    "Native capture stayed healthy with zero queue drops, but renderer backpressure still logged 38 events with 985 stale-frame drops by the end of the run.",
-    "The remaining gap is sender-side encoder behavior: after briefly reaching 1600x900 in FULL, outbound resolution drifted to 1200x675 while ABR still reported FULL."
-  ]
+    "Best session across all metrics: 91.3% FULL, zero degrades, 3.1% playout drift events.",
+    "Sender-stress removed as degrade trigger; only viewer-validated signals remain.",
+    "FULL held 1600x900 for 212s with no resolution drift.",
+    "Supersedes previous baseline 677fc60 (native handoff tuning).",
+    "Next opportunities: start at FULL, add FULL-lite tier, optimize native pipeline latency."
+  ],
+  "supersedes": "677fc60 / 2026-04-05T08-03-00-284Z-677fc60"
 }

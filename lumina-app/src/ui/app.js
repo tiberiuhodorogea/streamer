@@ -297,9 +297,24 @@ class AdaptiveQualityController {
     this._producerStats = {
       bitrateMbps: 0,
       fps: 0,
+      sourceFps: 0,
       stallSeconds: 0,
+      stressSeconds: 0,
+      stressReason: null,
+      headroomHealthy: false,
+      availableOutgoingBitrateMbps: null,
+      qualityLimitationReason: null,
+      degradationPreference: null,
+      nativeDroppedFrames: 0,
+      droppedFramesDelta: 0,
+      severeLagEvents: 0,
+      severeLagEventsDelta: 0,
+      submitMs: null,
+      captureToRendererMs: null,
+      frameAgeMs: null,
       lastUpdatedAt: 0,
       lastLoggedStallSeconds: 0,
+      lastLoggedStressSeconds: 0,
     };
 
     this.lastDegradeTime = 0;
@@ -339,9 +354,15 @@ class AdaptiveQualityController {
     this.playoutDeltaWarnToleranceMs = 180;
     this.playoutDeltaCriticalToleranceMs = 260;
     this.fullRecoveryPlayoutDeltaToleranceMs = 160;
-    this.fullRecoveryHoldMs = 20000;
+    this.fullRecoveryHoldMs = 8000;
     this.receiverSettleGraceMs = 10000;
-
+    this.senderStressEncodeWarnRatio = 0.82;
+    this.senderStressSourceWarnRatio = 0.85;
+    this.senderStressSevereRatio = 0.65;
+    this.senderStressFrameAgeWarnMs = 45;
+    this.senderStressSubmitWarnMs = 28;
+    this.senderStressPipelineWarnMs = 32;
+    this.senderStressDropWarnFrames = 6;
     this._serverBwe = null;
     this._serverBweTime = 0;
 
@@ -465,6 +486,23 @@ class AdaptiveQualityController {
   updateProducerStats(stats) {
     this._producerStats.bitrateMbps = stats.bitrateMbps || 0;
     this._producerStats.fps = stats.fps || 0;
+    this._producerStats.sourceFps = stats.sourceFps || 0;
+    this._producerStats.availableOutgoingBitrateMbps = stats.availableOutgoingBitrateMbps ?? null;
+    this._producerStats.qualityLimitationReason = stats.qualityLimitationReason || null;
+    this._producerStats.degradationPreference = stats.degradationPreference || null;
+    this._producerStats.submitMs = stats.submitMs ?? null;
+    this._producerStats.captureToRendererMs = stats.captureToRendererMs ?? null;
+    this._producerStats.frameAgeMs = stats.frameAgeMs ?? null;
+
+    const previousDroppedFrames = this._producerStats.nativeDroppedFrames || 0;
+    const nextDroppedFrames = stats.nativeDroppedFrames ?? previousDroppedFrames;
+    this._producerStats.nativeDroppedFrames = nextDroppedFrames;
+    this._producerStats.droppedFramesDelta = Math.max(0, nextDroppedFrames - previousDroppedFrames);
+
+    const previousSevereLagEvents = this._producerStats.severeLagEvents || 0;
+    const nextSevereLagEvents = stats.severeLagEvents ?? previousSevereLagEvents;
+    this._producerStats.severeLagEvents = nextSevereLagEvents;
+    this._producerStats.severeLagEventsDelta = Math.max(0, nextSevereLagEvents - previousSevereLagEvents);
     this._producerStats.lastUpdatedAt = Date.now();
 
     const targetFps = this.effectiveFps;
@@ -487,6 +525,70 @@ class AdaptiveQualityController {
       this._producerStats.stallSeconds = Math.max(0, this._producerStats.stallSeconds - 1);
       if (this._producerStats.stallSeconds === 0) {
         this._producerStats.lastLoggedStallSeconds = 0;
+      }
+    }
+
+    const effectiveBitrateMbps = this.effectiveBitrate / 1e6;
+    const qualityLimitationReason = (stats.qualityLimitationReason || '').toLowerCase();
+    const availableOutgoingBitrateMbps = stats.availableOutgoingBitrateMbps;
+    const headroomHealthy = qualityLimitationReason !== 'bandwidth' && (
+      availableOutgoingBitrateMbps == null ||
+      availableOutgoingBitrateMbps + 0.35 >= effectiveBitrateMbps * 0.92
+    );
+    this._producerStats.headroomHealthy = headroomHealthy;
+
+    const encodeWarnFps = Math.max(20, targetFps * this.senderStressEncodeWarnRatio);
+    const sourceWarnFps = Math.max(20, targetFps * this.senderStressSourceWarnRatio);
+    const severeWarnFps = Math.max(14, targetFps * this.senderStressSevereRatio);
+    const encodeDip = stats.fps != null && stats.fps < encodeWarnFps;
+    const sourceDip = stats.sourceFps != null && stats.sourceFps > 0 && stats.sourceFps < sourceWarnFps;
+    const severeEncodeStress = stats.fps != null && stats.fps < severeWarnFps;
+    const severeSourceStress = stats.sourceFps != null && stats.sourceFps > 0 && stats.sourceFps < severeWarnFps;
+    const bitrateDip = stats.bitrateMbps != null && stats.bitrateMbps < Math.max(1.5, effectiveBitrateMbps * 0.68);
+    const pipelinePressure =
+      (stats.submitMs != null && stats.submitMs >= this.senderStressSubmitWarnMs) ||
+      (stats.captureToRendererMs != null && stats.captureToRendererMs >= this.senderStressPipelineWarnMs) ||
+      (stats.frameAgeMs != null && stats.frameAgeMs >= this.senderStressFrameAgeWarnMs) ||
+      (this._producerStats.droppedFramesDelta >= this.senderStressDropWarnFrames) ||
+      (this._producerStats.severeLagEventsDelta > 0);
+    const balancedPreference = this.currentTier.label === 'FULL' || stats.degradationPreference === 'balanced';
+    const severeSenderStress = headroomHealthy && severeEncodeStress && (severeSourceStress || pipelinePressure || bitrateDip);
+    const senderStress = headroomHealthy && (
+      balancedPreference
+        ? ((encodeDip && sourceDip) || (encodeDip && (pipelinePressure || bitrateDip)) || (sourceDip && pipelinePressure))
+        : ((severeEncodeStress || severeSourceStress) && (pipelinePressure || bitrateDip))
+    );
+
+    if (severeSenderStress || senderStress) {
+      const nextStressSeconds = this._producerStats.stressSeconds + (severeSenderStress ? 2 : 1);
+      this._producerStats.stressSeconds = Math.min(6, nextStressSeconds);
+      this._producerStats.stressReason = [
+        encodeDip ? 'encode-fps-dip' : null,
+        sourceDip ? 'source-fps-dip' : null,
+        bitrateDip ? 'bitrate-dip' : null,
+        pipelinePressure ? 'pipeline-pressure' : null,
+      ].filter(Boolean).join(',') || 'sender-stress';
+      if (this._producerStats.stressSeconds >= 2 &&
+          this._producerStats.lastLoggedStressSeconds !== this._producerStats.stressSeconds) {
+        this._producerStats.lastLoggedStressSeconds = this._producerStats.stressSeconds;
+        this._logSession('encoder-pressure', {
+          stressSeconds: this._producerStats.stressSeconds,
+          stressReason: this._producerStats.stressReason,
+          bitrateMbps: Number((stats.bitrateMbps || 0).toFixed(2)),
+          fps: stats.fps || 0,
+          sourceFps: stats.sourceFps || 0,
+          availableOutgoingBitrateMbps: availableOutgoingBitrateMbps ?? null,
+          qualityLimitationReason: stats.qualityLimitationReason || null,
+          droppedFramesDelta: this._producerStats.droppedFramesDelta,
+          severeLagEventsDelta: this._producerStats.severeLagEventsDelta,
+          tier: this.currentTier.label,
+        });
+      }
+    } else {
+      this._producerStats.stressSeconds = Math.max(0, this._producerStats.stressSeconds - 1);
+      if (this._producerStats.stressSeconds === 0) {
+        this._producerStats.stressReason = null;
+        this._producerStats.lastLoggedStressSeconds = 0;
       }
     }
   }
@@ -727,6 +829,18 @@ class AdaptiveQualityController {
       }
     }
 
+    const impactedThreshold = Math.max(1, Math.ceil(viewerCount / 2));
+    let state = 'good';
+    if (criticalViewers >= impactedThreshold || bweCritical) {
+      state = 'critical';
+    } else if (criticalViewers === 1 && viewerCount > 1 && !bweCritical) {
+      state = isolatedTransport ? 'warning' : 'isolated-critical';
+    } else if (warningViewers >= impactedThreshold || bweWarn) {
+      state = 'warning';
+    } else if (warningViewers === 1 && viewerCount > 1) {
+      state = isolatedTransport ? 'warning' : 'isolated-warning';
+    }
+
     if (this._producerStats.stallSeconds >= 2) {
       return {
         state: 'encoder-stall',
@@ -739,20 +853,12 @@ class AdaptiveQualityController {
         worstJitterBuffer,
         worstJitterBufferDelta,
         worstPlayoutDrift,
+        producerFps: this._producerStats.fps || 0,
+        producerSourceFps: this._producerStats.sourceFps || 0,
+        producerStressSeconds: this._producerStats.stressSeconds || 0,
+        producerStressReason: this._producerStats.stressReason || null,
         aggregate,
       };
-    }
-
-    const impactedThreshold = Math.max(1, Math.ceil(viewerCount / 2));
-    let state = 'good';
-    if (criticalViewers >= impactedThreshold || bweCritical) {
-      state = 'critical';
-    } else if (criticalViewers === 1 && viewerCount > 1 && !bweCritical) {
-      state = isolatedTransport ? 'warning' : 'isolated-critical';
-    } else if (warningViewers >= impactedThreshold || bweWarn) {
-      state = 'warning';
-    } else if (warningViewers === 1 && viewerCount > 1) {
-      state = isolatedTransport ? 'warning' : 'isolated-warning';
     }
 
     return {
@@ -772,6 +878,11 @@ class AdaptiveQualityController {
       worstJitterBuffer,
       worstJitterBufferDelta,
       worstPlayoutDrift,
+      producerFps: this._producerStats.fps || 0,
+      producerSourceFps: this._producerStats.sourceFps || 0,
+      producerStressSeconds: this._producerStats.stressSeconds || 0,
+      producerStressReason: this._producerStats.stressReason || null,
+      producerHeadroomHealthy: this._producerStats.headroomHealthy,
       bottleneckViewerId,
       aggregate,
     };
@@ -792,6 +903,11 @@ class AdaptiveQualityController {
         worstJitterBufferMs: assessment.worstJitterBuffer || 0,
         worstJitterBufferDeltaMs: assessment.worstJitterBufferDelta || 0,
         worstPlayoutDriftMs: assessment.worstPlayoutDrift || 0,
+        producerFps: assessment.producerFps || 0,
+        producerSourceFps: assessment.producerSourceFps || 0,
+        producerStressSeconds: assessment.producerStressSeconds || 0,
+        producerStressReason: assessment.producerStressReason || null,
+        producerHeadroomHealthy: assessment.producerHeadroomHealthy || false,
         bottleneckViewerId: assessment.bottleneckViewerId || null,
       });
       this._lastHealthState = assessment.state;
@@ -937,6 +1053,9 @@ class AdaptiveQualityController {
   _stepDown(steps, assessment) {
     const prevTier = this.tierIndex;
     this.tierIndex = Math.min(this.tiers.length - 1, this.tierIndex + steps);
+    this._producerStats.stressSeconds = 0;
+    this._producerStats.stressReason = null;
+    this._producerStats.lastLoggedStressSeconds = 0;
     if (this.tierIndex !== prevTier) {
       for (const [, health] of this.viewerHealth) {
         health.baselineSamples = 0;
@@ -975,6 +1094,9 @@ class AdaptiveQualityController {
   _stepUp(steps, assessment) {
     const prevTier = this.tierIndex;
     this.tierIndex = Math.max(0, this.tierIndex - steps);
+    this._producerStats.stressSeconds = 0;
+    this._producerStats.stressReason = null;
+    this._producerStats.lastLoggedStressSeconds = 0;
     if (this.tierIndex !== prevTier) {
       for (const [, health] of this.viewerHealth) {
         health.baselineSamples = 0;
@@ -2594,13 +2716,11 @@ class LuminaApp {
           }
         });
 
-        this.updateStatsDisplay(bitrateMbps, fps);
-        if (bitrateMbps !== null || fps !== null) {
-          this.abr.updateProducerStats({ bitrateMbps, fps });
-        }
-
+        const nativeFrameAge = this._getNativeFrameTelemetrySnapshot();
+        const nativePipeline = this._getNativePipelineTelemetrySnapshot();
+        let captureSnapshot = this._lastPipelineSnapshot?.capture || null;
         if (pipelineStats.mediaSource || pipelineStats.track || pipelineStats.outbound) {
-          const captureSnapshot = {
+          captureSnapshot = {
             sourceFps: pipelineStats.mediaSource?.framesPerSecond ?? pipelineStats.track?.framesPerSecond ?? null,
             sourceWidth: pipelineStats.mediaSource?.frameWidth ?? pipelineStats.track?.frameWidth ?? null,
             sourceHeight: pipelineStats.mediaSource?.frameHeight ?? pipelineStats.track?.frameHeight ?? null,
@@ -2627,6 +2747,26 @@ class LuminaApp {
           this._logOutboundResolutionChange(captureSnapshot);
         }
 
+        this.updateStatsDisplay(bitrateMbps, fps);
+        if (bitrateMbps !== null || fps !== null) {
+          const bwe = this.abr._serverBwe;
+          const bweAge = Date.now() - this.abr._serverBweTime;
+          this.abr.updateProducerStats({
+            bitrateMbps,
+            fps,
+            sourceFps: captureSnapshot?.sourceFps ?? null,
+            availableOutgoingBitrateMbps: captureSnapshot?.availableOutgoingBitrateMbps ?? null,
+            qualityLimitationReason: captureSnapshot?.qualityLimitationReason ?? null,
+            degradationPreference: captureSnapshot?.degradationPreference ?? null,
+            nativeDroppedFrames: this._nativeVideoDroppedFrames || 0,
+            severeLagEvents: nativePipeline?.severeLagEvents ?? 0,
+            submitMs: nativePipeline?.submitMs?.lastMs ?? null,
+            captureToRendererMs: nativePipeline?.captureToRendererMs?.lastMs ?? null,
+            frameAgeMs: nativeFrameAge?.lastFrameAgeMs ?? null,
+            deliveryBitrateMbps: bwe && bweAge < 6000 ? bwe.aggregate.minDeliveryMbps ?? null : null,
+          });
+        }
+
         // Periodic stats snapshot (every 5s)
         if (bitrateMbps !== null && window.electron?.sessionLog) {
           this._statsTickCount = (this._statsTickCount || 0) + 1;
@@ -2644,11 +2784,9 @@ class LuminaApp {
                 nativeCapture: this._nativeVideoActive || false,
                 nativeFrameCount: this._nativeVideoFrameCount || 0,
               };
-              const nativeFrameAge = this._getNativeFrameTelemetrySnapshot();
               if (nativeFrameAge) {
                 snapshot.capture.nativeFrameAge = nativeFrameAge;
               }
-              const nativePipeline = this._getNativePipelineTelemetrySnapshot();
               if (nativePipeline) {
                 snapshot.capture.nativePipeline = nativePipeline;
               }
@@ -2670,6 +2808,8 @@ class LuminaApp {
             this._maybeTrackEncoderResolutionDrift(snapshot);
             snapshot.encoder = {
               stallSeconds: this.abr._producerStats.stallSeconds,
+              stressSeconds: this.abr._producerStats.stressSeconds,
+              stressReason: this.abr._producerStats.stressReason || null,
             };
             const captureSummary = snapshot.capture
               ? ' capture=' + (snapshot.capture.sourceWidth || '--') + 'x' + (snapshot.capture.sourceHeight || '--') +

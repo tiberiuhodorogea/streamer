@@ -188,6 +188,7 @@ class DebugConsole {
 }
 
 const debugConsole = new DebugConsole();
+const VIEWER_BUILD_ID = 'viewer-sfu-2';
 
 window.addEventListener('error', (event) => {
   debugConsole.error('Window error: ' + event.message);
@@ -210,6 +211,8 @@ class ViewerApp {
     this.remoteStream = null;
     this.selectedLumina = null;
     this.selectedLuminaName = '';
+    this.signalingSessionInfo = null;
+    this._pageLoadedAtIso = new Date().toISOString();
     this.statsInterval = null;
     this.connectTimeout = null;
     this.audioMuted = true;
@@ -226,7 +229,7 @@ class ViewerApp {
 
     this.prefillServerUrl();
     this.initializeUI();
-    debugConsole.info('Viewer app initialized (SFU mode)');
+    debugConsole.info('Viewer app initialized (SFU mode) build=' + VIEWER_BUILD_ID + ' loadedAt=' + this._pageLoadedAtIso);
   }
 
   prefillServerUrl() {
@@ -442,6 +445,11 @@ class ViewerApp {
     this.socket.on('joined', async (data) => {
       debugConsole.info('[SFU] Joined room — setting up consumer transport');
       try {
+        this.signalingSessionInfo = data.signalingSession || null;
+        if (this.signalingSessionInfo?.sessionId) {
+          debugConsole.info('[SESSION] Bound to signaling session ' + this.signalingSessionInfo.sessionId +
+            ' (' + this.signalingSessionInfo.sessionDirName + ')');
+        }
         await this.setupMediasoup(data.routerRtpCapabilities);
         await this.startConsuming();
         this._pendingStreamRecovery = false;
@@ -797,6 +805,10 @@ class ViewerApp {
             droppedFramesDelta,
             jitterBufferDelayMs,
             decodeLatencyMs,
+            signalingSessionId: this.signalingSessionInfo?.sessionId || null,
+            reportedAtIso: new Date().toISOString(),
+            viewerBuildId: VIEWER_BUILD_ID,
+            pageLoadedAtIso: this._pageLoadedAtIso,
           });
 
           // Detailed diagnostic log every 5 seconds
@@ -832,6 +844,7 @@ class ViewerApp {
     document.getElementById('connectionQuality').textContent = '';
     this.selectedLumina = null;
     this.selectedLuminaName = '';
+    this.signalingSessionInfo = null;
     this.setOverlayState('Idle');
     this.showError(message);
   }

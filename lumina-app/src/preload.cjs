@@ -28,6 +28,21 @@ try {
       ipcRenderer.removeAllListeners('game-audio-chunk');
     },
 
+    // Native video capture APIs (DXGI Desktop Duplication)
+    isNativeVideoCaptureAvailable: () => ipcRenderer.invoke('native-video-capture-available'),
+    startNativeVideoCapture: (opts) => ipcRenderer.invoke('start-native-video-capture', opts),
+    stopNativeVideoCapture: () => ipcRenderer.invoke('stop-native-video-capture'),
+
+    onGameVideoFrame: (callback) => {
+      ipcRenderer.removeAllListeners('game-video-frame');
+      ipcRenderer.on('game-video-frame', (_event, buffer, meta) => {
+        callback(buffer, meta);
+      });
+    },
+    removeGameVideoFrameListener: () => {
+      ipcRenderer.removeAllListeners('game-video-frame');
+    },
+
     on: (channel, func) => ipcRenderer.on(channel, (event, ...args) => func(...args)),
     once: (channel, func) => ipcRenderer.once(channel, (event, ...args) => func(...args)),
   });

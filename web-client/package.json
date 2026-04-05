@@ -4,8 +4,8 @@
   "description": "Browser viewer for Lumina streams",
   "type": "module",
   "scripts": {
-    "start": "npx http-server -p 3000 -o",
-    "dev": "npx http-server -p 3000"
+    "start": "npx http-server -p 3000 -a 0.0.0.0 -c-1 -o",
+    "dev": "npx http-server -p 3000 -a 0.0.0.0 -c-1"
   },
   "devDependencies": {
     "http-server": "^14.1.1"

@@ -50,12 +50,42 @@ function registerAudioCallback(callback) {
   return addon.registerAudioCallback(callback);
 }
 
+// ── Native video capture (DXGI Desktop Duplication) ──
+
+function startVideoCapture(opts) {
+  if (!addon || typeof addon.startVideoCapture !== 'function') {
+    throw new Error('Native video capture not available');
+  }
+  return addon.startVideoCapture(opts || {});
+}
+
+function stopVideoCapture() {
+  if (addon && typeof addon.stopVideoCapture === 'function') {
+    return addon.stopVideoCapture();
+  }
+}
+
+function registerVideoCallback(callback) {
+  if (!addon || typeof addon.registerVideoCallback !== 'function') {
+    throw new Error('Native video capture not available');
+  }
+  return addon.registerVideoCallback(callback);
+}
+
+function isVideoCapturing() {
+  return !!(addon && typeof addon.isVideoCapturing === 'function' && addon.isVideoCapturing());
+}
+
 module.exports = {
   enumGameWindows,
   isProcessAudioSupported,
   startProcessAudioCapture,
   stopProcessAudioCapture,
   registerAudioCallback,
+  startVideoCapture,
+  stopVideoCapture,
+  registerVideoCallback,
+  isVideoCapturing,
   /** True if the compiled .node binary loaded successfully */
   available: !!addon,
 };

@@ -6,7 +6,8 @@
     "sources": [
       "src/addon.cpp",
       "src/game_detect.cpp",
-      "src/process_audio.cpp"
+      "src/process_audio.cpp",
+      "src/game_video.cpp"
     ],
     "include_dirs": [
       "<!@(node -p \"require('node-addon-api').include\")"
@@ -31,7 +32,9 @@
           "-lole32.lib",
           "-lpsapi.lib",
           "-lpropsys.lib",
-          "-lmmdevapi.lib"
+          "-lmmdevapi.lib",
+          "-ld3d11.lib",
+          "-ldxgi.lib"
         ]
       }]
     ]

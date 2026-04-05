@@ -22,46 +22,69 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 // All session data goes to logs/sessions/<sessionId>/
 // Each session gets: session.meta.json, signaling.jsonl, summary on close
 // ============================================
-const sessionStartedAt = new Date();
-const sessionId = sessionStartedAt.toISOString().replace(/[:.]/g, '-');
 let gitCommit = 'unknown';
 try {
   gitCommit = execSync('git rev-parse --short HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
 } catch {}
 
-const sessionDir = path.join(repoRoot, 'logs', 'sessions', `${sessionId}-${gitCommit}`);
-fs.mkdirSync(sessionDir, { recursive: true });
+let sessionStartedAt = null;
+let sessionId = null;
+let sessionDir = null;
+let sessionLogPath = null;
+let sessionMetaPath = null;
+let sessionStats = null;
 
-const sessionLogPath = path.join(sessionDir, 'signaling.jsonl');
-const sessionMetaPath = path.join(sessionDir, 'session.meta.json');
+function createSessionStats(startedAt) {
+  return {
+    totalViewerJoins: 0,
+    totalViewerLeaves: 0,
+    totalQualityReports: 0,
+    totalLuminaRegistrations: 0,
+    peakViewerCount: 0,
+    qualityReportSamples: [],
+    bweSamples: [],
+    abrEvents: [],
+    bottleneckChanges: 0,
+    transportIssues: [],
+    startedAt: startedAt.toISOString(),
+    endedAt: null,
+  };
+}
 
-// Session-level aggregated stats for comparison
-const sessionStats = {
-  totalViewerJoins: 0,
-  totalViewerLeaves: 0,
-  totalQualityReports: 0,
-  totalLuminaRegistrations: 0,
-  peakViewerCount: 0,
-  qualityReportSamples: [],   // last N for summary
-  bweSamples: [],
-  abrEvents: [],               // ABR tier changes
-  bottleneckChanges: 0,
-  transportIssues: [],          // DTLS failures, transport errors
-  startedAt: sessionStartedAt.toISOString(),
-  endedAt: null,
-};
+function getCurrentSessionInfo() {
+  return {
+    sessionId,
+    gitCommit,
+    startedAt: sessionStartedAt?.toISOString() || null,
+    sessionDirName: sessionDir ? path.basename(sessionDir) : null,
+  };
+}
 
-fs.writeFileSync(sessionMetaPath, JSON.stringify({
-  sessionId,
-  gitCommit,
-  startedAt: sessionStartedAt.toISOString(),
-  server: 'signaling-server',
-  announcedIp: process.env.ANNOUNCED_IP || null,
-  nodeVersion: process.version,
-  platform: process.platform,
-  arch: process.arch,
-  sessionDir,
-}, null, 2));
+function openNewSession(reason = 'startup', meta = {}) {
+  sessionStartedAt = new Date();
+  sessionId = sessionStartedAt.toISOString().replace(/[:.]/g, '-');
+  sessionDir = path.join(repoRoot, 'logs', 'sessions', `${sessionId}-${gitCommit}`);
+  sessionLogPath = path.join(sessionDir, 'signaling.jsonl');
+  sessionMetaPath = path.join(sessionDir, 'session.meta.json');
+  sessionStats = createSessionStats(sessionStartedAt);
+
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(sessionMetaPath, JSON.stringify({
+    sessionId,
+    gitCommit,
+    startedAt: sessionStartedAt.toISOString(),
+    server: 'signaling-server',
+    announcedIp: process.env.ANNOUNCED_IP || null,
+    nodeVersion: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    sessionDir,
+    reason,
+    ...meta,
+  }, null, 2));
+
+  console.log('[SESSION] Logging to ' + sessionDir);
+}
 
 function appendSessionLog(type, payload) {
   fs.appendFileSync(sessionLogPath, JSON.stringify({
@@ -71,8 +94,11 @@ function appendSessionLog(type, payload) {
   }) + '\n');
 }
 
-function writeSessionSummary() {
+function writeSessionSummary(endReason = 'shutdown') {
+  if (!sessionStats || !sessionStartedAt || !sessionDir) return;
+
   sessionStats.endedAt = new Date().toISOString();
+  sessionStats.endReason = endReason;
   const durationMs = Date.now() - sessionStartedAt.getTime();
   sessionStats.durationSec = Math.round(durationMs / 1000);
 
@@ -125,7 +151,33 @@ function writeSessionSummary() {
   console.log('[SESSION] Summary written to ' + summaryPath);
 }
 
-console.log('[SESSION] Logging to ' + sessionDir);
+function rotateSession(reason, meta = {}) {
+  const previous = getCurrentSessionInfo();
+  if (previous.sessionId) {
+    writeSessionSummary('rotate:' + reason);
+  }
+
+  openNewSession(reason, {
+    previousSessionId: previous.sessionId,
+    previousSessionDirName: previous.sessionDirName,
+    ...meta,
+  });
+
+  appendSessionLog('session-rotated', {
+    reason,
+    previousSessionId: previous.sessionId,
+    previousSessionDirName: previous.sessionDirName,
+    ...meta,
+  });
+
+  if (worker) {
+    appendSessionLog('worker-reused', { pid: worker.pid, reason });
+  }
+
+  return getCurrentSessionInfo();
+}
+
+openNewSession('startup');
 
 // ============================================
 // CONFIGURATION
@@ -424,6 +476,11 @@ async function handleLuminaRegister(clientId, data, ws) {
   console.log('[SFU] Registering Lumina host: ' + name);
 
   try {
+    if (rooms.size === 0 && sessionStats.totalLuminaRegistrations > 0) {
+      rotateSession('streamer-register', { clientId, streamerName: name });
+    }
+
+    const signalingSession = getCurrentSessionInfo();
     const router = await worker.createRouter({ mediaCodecs: MEDIA_CODECS });
 
     rooms.set(clientId, {
@@ -443,10 +500,15 @@ async function handleLuminaRegister(clientId, data, ws) {
     client.roomId = clientId;
 
     sessionStats.totalLuminaRegistrations++;
-    appendSessionLog('lumina-registered', { clientId, name });
+    appendSessionLog('lumina-registered', {
+      clientId,
+      name,
+      signalingSessionId: signalingSession.sessionId,
+    });
 
     send(ws, 'registered', {
       routerRtpCapabilities: router.rtpCapabilities,
+      signalingSession,
     });
 
     for (const [cid, c] of clients) {
@@ -600,6 +662,7 @@ async function handleViewerJoin(clientId, data, ws) {
   send(ws, 'joined', {
     routerRtpCapabilities: room.router.rtpCapabilities,
     streamerId,
+    signalingSession: getCurrentSessionInfo(),
   });
 }
 
@@ -996,6 +1059,11 @@ function handleViewerQualityReport(clientId, data) {
   appendSessionLog('viewer-quality-report', {
     clientId,
     streamerId: room.streamer?.id || null,
+    signalingSessionId: sessionId,
+    viewerSignalingSessionId: data.signalingSessionId || null,
+    viewerReportedAtIso: data.reportedAtIso || null,
+    viewerBuildId: data.viewerBuildId || null,
+    pageLoadedAtIso: data.pageLoadedAtIso || null,
     fps: data.fps,
     bitrateMbps: data.bitrateMbps,
     frameWidth: data.frameWidth,
@@ -1040,6 +1108,7 @@ function handleViewerQualityReport(clientId, data) {
 
   send(room.streamer.ws, 'viewer-quality-report', {
     viewerId: clientId,
+    signalingSessionId: sessionId,
     fps: data.fps,
     bitrateMbps: data.bitrateMbps,
     frameWidth: data.frameWidth,
@@ -1103,7 +1172,7 @@ function handleDisconnect(clientId) {
 
 function shutdown() {
   console.log('\n[Server] Shutting down gracefully...');
-  writeSessionSummary();
+  writeSessionSummary('shutdown');
   clearInterval(heartbeatTimer);
   for (const roomId of bweIntervals.keys()) stopBwePolling(roomId);
   wss.clients.forEach((ws) => ws.terminate());

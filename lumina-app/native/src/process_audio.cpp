@@ -1,4 +1,5 @@
 #include "process_audio.h"
+#include "native_log.h"
 
 #include <windows.h>
 #include <Audioclient.h>
@@ -16,8 +17,14 @@
 #include <thread>
 #include <vector>
 
-#define AUDIO_LOG(fmt, ...) fprintf(stderr, "[PROCESS-AUDIO] " fmt "\n", ##__VA_ARGS__)
-#define AUDIO_LOG_HR(label, hr) fprintf(stderr, "[PROCESS-AUDIO] %s hr=0x%08lx\n", label, static_cast<unsigned long>(hr))
+#define AUDIO_LOG(fmt, ...) do { \
+    fprintf(stderr, "[PROCESS-AUDIO] " fmt "\n", ##__VA_ARGS__); \
+    native_log::writef("PROCESS-AUDIO", fmt, ##__VA_ARGS__); \
+} while (0)
+#define AUDIO_LOG_HR(label, hr) do { \
+    fprintf(stderr, "[PROCESS-AUDIO] %s hr=0x%08lx\n", label, static_cast<unsigned long>(hr)); \
+    native_log::writef("PROCESS-AUDIO", "%s hr=0x%08lx", label, static_cast<unsigned long>(hr)); \
+} while (0)
 
 using Microsoft::WRL::RuntimeClass;
 using Microsoft::WRL::RuntimeClassFlags;

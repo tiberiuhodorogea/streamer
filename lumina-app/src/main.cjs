@@ -48,6 +48,7 @@ if (!luminaSessionDir) {
 }
 
 const luminaLogPath = path.join(luminaSessionDir, 'lumina.jsonl');
+process.env.LUMINA_NATIVE_LOG_PATH = path.join(luminaSessionDir, 'native-addon.log');
 console.log('[SESSION] Lumina logging to ' + luminaLogPath);
 
 function appendLuminaLog(type, payload) {
@@ -205,7 +206,7 @@ function findKnownGameAlias(name) {
 function findLikelyGameProcessForSource(sourceName, gameHwnds) {
   const sourceKey = normalizeCaptureName(sourceName);
   const sourceBase = stripGameSuffixes(sourceName);
-  if (!sourceKey) return null;
+  if (!sourceKey || sourceKey.length < 8 || sourceBase.length < 6) return null;
 
   let bestMatch = null;
   let bestScore = 0;
@@ -213,13 +214,12 @@ function findLikelyGameProcessForSource(sourceName, gameHwnds) {
   for (const item of gameHwnds.values()) {
     const processKey = normalizeCaptureName(item.name);
     const processBase = stripGameSuffixes(item.name);
-    if (!processKey) continue;
+    if (!processKey || processKey.length < 8 || processBase.length < 6) continue;
 
     let score = 0;
     if (sourceKey === processKey || sourceBase === processBase) score = 100;
-    else if (sourceKey.includes(processBase) || processBase.includes(sourceKey)) score = 90;
-    else if (sourceBase && (sourceKey.includes(sourceBase) || sourceBase.includes(sourceKey))) score = 80;
-    else if (processBase && (sourceBase.includes(processBase) || processBase.includes(sourceBase))) score = 70;
+    else if (processBase && sourceKey.includes(processBase)) score = 90;
+    else if (sourceBase && processKey.includes(sourceBase)) score = 80;
 
     if (score > bestScore) {
       bestScore = score;
@@ -409,6 +409,65 @@ ipcMain.handle('stop-native-process-audio', async () => {
     nativeCapture.stopProcessAudioCapture();
     return { success: true };
   } catch (err) {
+    return { success: false, reason: err.message };
+  }
+});
+
+// ========== NATIVE VIDEO CAPTURE (DXGI Desktop Duplication) ==========
+
+ipcMain.handle('native-video-capture-available', () => {
+  return !!(nativeCapture && typeof nativeCapture.startVideoCapture === 'function');
+});
+
+ipcMain.handle('start-native-video-capture', async (_event, opts) => {
+  console.log('[VIDEO-IPC] start-native-video-capture called, opts=' + JSON.stringify(opts || {}));
+  if (!nativeCapture || typeof nativeCapture.startVideoCapture !== 'function') {
+    console.warn('[VIDEO-IPC] Native video capture module unavailable');
+    return { success: false, reason: 'not-available' };
+  }
+  try {
+    if (typeof nativeCapture.registerVideoCallback === 'function') {
+      let frameCount = 0;
+      nativeCapture.registerVideoCallback((pixels, meta) => {
+        try {
+          if (!mainWindow || mainWindow.isDestroyed()) return;
+          frameCount++;
+          if (frameCount === 1) {
+            console.log('[VIDEO-IPC] First video frame: ' + meta.width + 'x' + meta.height +
+              ' stride=' + meta.stride + ' bytes=' + pixels.byteLength);
+          } else if (frameCount % 300 === 0) {
+            console.log('[VIDEO-IPC] Video frame #' + frameCount);
+          }
+          // Transfer the ArrayBuffer to the renderer (avoids copy)
+          mainWindow.webContents.send('game-video-frame', pixels.buffer, meta);
+        } catch (error) {
+          if (frameCount <= 3) {
+            console.warn('[VIDEO-IPC] Frame forwarding failed:', error.message);
+          }
+        }
+      });
+      console.log('[VIDEO-IPC] Video callback registered');
+    }
+
+    const result = nativeCapture.startVideoCapture(opts || {});
+    console.log('[VIDEO-IPC] startVideoCapture returned:', JSON.stringify(result));
+    return result;
+  } catch (err) {
+    console.error('[VIDEO-IPC] Video capture start FAILED:', err.message);
+    return { success: false, reason: err.message };
+  }
+});
+
+ipcMain.handle('stop-native-video-capture', async () => {
+  console.log('[VIDEO-IPC] stop-native-video-capture called');
+  if (!nativeCapture || typeof nativeCapture.stopVideoCapture !== 'function') {
+    return { success: false, reason: 'not-available' };
+  }
+  try {
+    nativeCapture.stopVideoCapture();
+    return { success: true };
+  } catch (err) {
+    console.error('[VIDEO-IPC] Video capture stop FAILED:', err.message);
     return { success: false, reason: err.message };
   }
 });

@@ -249,14 +249,20 @@ const logger = new DebugLogger();
 // ============================================
 const SMOOTHNESS_PROFILE = {
   label: 'Auto Smoothness',
-  hint: 'Automatic 1080p/60 target that protects motion first and detail second',
-  summary: 'Automatic 1080p / 60 fps with continuous network-aware adaptation',
-  maxWidth: 1920,
-  maxHeight: 1080,
+  hint: 'Starts games at 720p/60 and only recovers upward after a stable window',
+  summary: 'Smoothness-first game profile with a 1600x900 / 60 ceiling and conservative warm-up',
+  maxWidth: 1600,
+  maxHeight: 900,
   maxFrameRate: 60,
-  maxBitrate: 16_000_000,
-  startBitrate: 9_000_000,
+  maxBitrate: 12_000_000,
+  startBitrate: 5_500_000,
   minBitrate: 2_500_000,
+  startTierIndex: 1,
+  recoverWaitMs: 12_000,
+  recoverCooldownMs: 6_000,
+  startupRampMs: 15_000,
+  nativeMaxWidth: 1600,
+  nativeMaxHeight: 900,
 };
 
 // ============================================
@@ -265,11 +271,11 @@ const SMOOTHNESS_PROFILE = {
 // ============================================
 const DEGRADATION_TIERS = [
   { bitratePct: 1.00, scaleDown: 1.0, fpsFraction: 1.0, label: 'FULL' },
-  { bitratePct: 0.82, scaleDown: 1.0, fpsFraction: 1.0, label: 'FLOW' },
-  { bitratePct: 0.68, scaleDown: 1.15, fpsFraction: 1.0, label: 'SAFE' },
-  { bitratePct: 0.54, scaleDown: 1.35, fpsFraction: 1.0, label: 'SHIELD' },
-  { bitratePct: 0.40, scaleDown: 1.6, fpsFraction: 0.83, label: 'RESCUE' },
-  { bitratePct: 0.30, scaleDown: 2.0, fpsFraction: 0.67, label: 'LAST' },
+  { bitratePct: 0.72, scaleDown: 1.25, fpsFraction: 1.0, label: 'FLOW' },
+  { bitratePct: 0.58, scaleDown: 1.5, fpsFraction: 1.0, label: 'SAFE' },
+  { bitratePct: 0.46, scaleDown: 1.75, fpsFraction: 1.0, label: 'SHIELD' },
+  { bitratePct: 0.34, scaleDown: 2.0, fpsFraction: 0.92, label: 'RESCUE' },
+  { bitratePct: 0.24, scaleDown: 2.5, fpsFraction: 0.75, label: 'LAST' },
 ];
 
 // ============================================
@@ -280,7 +286,8 @@ class AdaptiveQualityController {
   constructor(luminaApp) {
     this.app = luminaApp;
     this.enabled = true;
-    this.startupTierIndex = 1;
+    this.defaultStartupTierIndex = 1;
+    this.startupTierIndex = this.defaultStartupTierIndex;
     this.tierIndex = this.startupTierIndex;
     this.profileMaxBitrate = SMOOTHNESS_PROFILE.maxBitrate;
     this.profileMaxFps = SMOOTHNESS_PROFILE.maxFrameRate;
@@ -306,9 +313,12 @@ class AdaptiveQualityController {
 
     this.degradeCooldownMs = 2500;
     this.warningDegradeCooldownMs = 6000;
-    this.recoverCooldownMs = 1500;
-    this.recoverWaitMs = 2500;
-    this.startupRampMs = 4000;
+    this.defaultRecoverCooldownMs = 1500;
+    this.defaultRecoverWaitMs = 2500;
+    this.defaultStartupRampMs = 4000;
+    this.recoverCooldownMs = this.defaultRecoverCooldownMs;
+    this.recoverWaitMs = this.defaultRecoverWaitMs;
+    this.startupRampMs = this.defaultStartupRampMs;
 
     this.jitterWarnMs = 55;
     this.jitterCriticalMs = 85;
@@ -319,6 +329,9 @@ class AdaptiveQualityController {
     this.lossWarnRate = 0.03;
     this.lossCriticalRate = 0.06;
     this.recoveryProbeMs = 12000;
+    this.recoveryJitterBufferMaxMs = 32;
+    this.fullRecoveryJitterBufferMaxMs = 24;
+    this.fullRecoveryHoldMs = 20000;
 
     this._serverBwe = null;
     this._serverBweTime = 0;
@@ -343,10 +356,17 @@ class AdaptiveQualityController {
     return Math.max(24, Math.round(this.profileMaxFps * this.currentTier.fpsFraction));
   }
 
-  setProfile(bitrate, fps) {
+  setProfile(bitrate, fps, options = {}) {
     this.profileMaxBitrate = bitrate;
     this.profileMaxFps = fps || 60;
     this.floor = Math.max(SMOOTHNESS_PROFILE.minBitrate, Math.round(this.profileMaxBitrate * 0.18));
+    this.startupTierIndex = Math.min(
+      options.startTierIndex ?? this.defaultStartupTierIndex,
+      this.tiers.length - 1
+    );
+    this.recoverCooldownMs = options.recoverCooldownMs ?? this.defaultRecoverCooldownMs;
+    this.recoverWaitMs = options.recoverWaitMs ?? this.defaultRecoverWaitMs;
+    this.startupRampMs = options.startupRampMs ?? this.defaultStartupRampMs;
     this.tierIndex = Math.min(this.startupTierIndex, this.tiers.length - 1);
     this._streamStartTime = Date.now();
     this._stuckAtMinSince = 0;
@@ -530,9 +550,8 @@ class AdaptiveQualityController {
           this.goodHealthStart = now;
         } else if (now - this.goodHealthStart >= (inStartupRamp ? 1500 : this.recoverWaitMs) &&
                    now - this.lastRecoverTime >= this.recoverCooldownMs &&
-                   this._canStepUp(now)) {
-          const veryGood = this._isVeryGoodHealth();
-          this._stepUp(inStartupRamp ? 1 : (veryGood ? 2 : 1), assessment);
+                   this._canStepUp(now, assessment)) {
+          this._stepUp(1, assessment);
         }
       } else {
         this.goodHealthStart = 0;
@@ -565,6 +584,7 @@ class AdaptiveQualityController {
     let bottleneckViewerId = null;
     let worstViewerScore = -Infinity;
     let worstDecodeLatency = 0;
+    let worstJitterBuffer = 0;
 
     for (const [viewerId, health] of this.viewerHealth) {
       if (health.fpsSamples.length < 2) continue;
@@ -614,6 +634,7 @@ class AdaptiveQualityController {
       worstJitter = Math.max(worstJitter, avgJitter);
       worstLoss = Math.max(worstLoss, health.lossRate);
       worstDecodeLatency = Math.max(worstDecodeLatency, avgDecodeLatency);
+      worstJitterBuffer = Math.max(worstJitterBuffer, avgJitterBuffer);
       if (recentAvg > 0 || health.bitrateMbps > 0.3) allZeroViewers = false;
     }
 
@@ -625,6 +646,7 @@ class AdaptiveQualityController {
         warningViewers,
         criticalViewers,
         bottleneckViewerId,
+        worstJitterBuffer,
       };
     }
 
@@ -661,6 +683,7 @@ class AdaptiveQualityController {
         criticalViewers,
         bottleneckViewerId,
         worstDecodeLatency,
+        worstJitterBuffer,
         aggregate,
       };
     }
@@ -691,6 +714,7 @@ class AdaptiveQualityController {
       worstJitter,
       worstLoss,
       worstDecodeLatency,
+      worstJitterBuffer,
       bottleneckViewerId,
       aggregate,
     };
@@ -708,19 +732,43 @@ class AdaptiveQualityController {
         viewerCount: assessment.viewerCount || 0,
         warningViewers: assessment.warningViewers || 0,
         criticalViewers: assessment.criticalViewers || 0,
+        worstJitterBufferMs: assessment.worstJitterBuffer || 0,
         bottleneckViewerId: assessment.bottleneckViewerId || null,
       });
       this._lastHealthState = assessment.state;
     }
   }
 
-  _canStepUp(now) {
+  _canStepUp(now, assessment) {
     if (this.tierIndex === 0) return false;
 
     const nextTier = this.tiers[this.tierIndex - 1];
+    const steppingToFull = this.tierIndex - 1 === 0;
     const neededMbps = (this.profileMaxBitrate * nextTier.bitratePct) / 1e6;
     const viewerMbps = this._getMinViewerBitrate();
     let currentMbps = viewerMbps;
+
+    if ((assessment?.worstJitterBuffer || 0) > this.recoveryJitterBufferMaxMs) {
+      if (this._evalCounter % 3 === 0) {
+        logger.debug('[ABR] Recovery gated: jitterBuffer=' + assessment.worstJitterBuffer.toFixed(1) + 'ms');
+      }
+      return false;
+    }
+
+    if (steppingToFull) {
+      if (now - this.lastDegradeTime < this.fullRecoveryHoldMs) {
+        if (this._evalCounter % 3 === 0) {
+          logger.debug('[ABR] Recovery gated: hold-before-FULL ' + ((this.fullRecoveryHoldMs - (now - this.lastDegradeTime)) / 1000).toFixed(1) + 's remaining');
+        }
+        return false;
+      }
+      if ((assessment?.worstJitterBuffer || 0) > this.fullRecoveryJitterBufferMaxMs) {
+        if (this._evalCounter % 3 === 0) {
+          logger.debug('[ABR] Recovery gated: FULL requires jitterBuffer<=' + this.fullRecoveryJitterBufferMaxMs + 'ms, actual=' + assessment.worstJitterBuffer.toFixed(1) + 'ms');
+        }
+        return false;
+      }
+    }
 
     const bwe = this._serverBwe;
     const bweAge = now - this._serverBweTime;
@@ -756,9 +804,10 @@ class AdaptiveQualityController {
       (availableMbps > 0 && availableMbps < currentTargetMbps * 0.9) ||
       (viewerDeliveryMbps > 0 && viewerDeliveryMbps < currentTargetMbps * 0.72);
     const decodePressure = (assessment.worstDecodeLatency || 0) > this.decodeLatencyWarnMs;
+    const latencyPressure = (assessment.worstJitterBuffer || 0) > this.recoveryJitterBufferMaxMs;
     const viewerPressure = (assessment.worstLoss || 0) > this.lossWarnRate;
 
-    return transportPressure || headroomTight || decodePressure || viewerPressure;
+    return transportPressure || headroomTight || decodePressure || latencyPressure || viewerPressure;
   }
 
   _isVeryGoodHealth() {
@@ -771,9 +820,12 @@ class AdaptiveQualityController {
       const baseline = health.baselineSamples >= 3 ? health.baselineFps : recentAvg;
       const jRecent = health.jitterSamples.slice(-3);
       const jAvg = jRecent.reduce((a, b) => a + b, 0) / jRecent.length;
+      const jitterBufferRecent = health.jitterBufferSamples.slice(-3);
+      const jitterBufferAvg = jitterBufferRecent.reduce((a, b) => a + b, 0) / Math.max(1, jitterBufferRecent.length);
       const drops = health.droppedFramesSamples.slice(-3).reduce((a, b) => a + b, 0);
       if (baseline > 5 && recentAvg < baseline * 0.95) return false;
       if (jAvg > 25) return false;
+      if (jitterBufferAvg > this.fullRecoveryJitterBufferMaxMs) return false;
       if (health.lossRate > 0.01) return false;
       if (drops > 2) return false;
     }
@@ -934,6 +986,28 @@ class LuminaApp {
       this._nativeGameAudioQueue = [];
       this._captureDiagnosticsLogged = false;
       this._lastCaptureTelemetry = null;
+      // Native DXGI video capture state
+      this._nativeVideoCanvas = null;
+      this._nativeVideoCtx = null;
+      this._nativeVideoStream = null;
+      this._nativeVideoActive = false;
+      this._nativeVideoFrameCount = 0;
+      this._nativeVideoGenerator = null;  // MediaStreamTrackGenerator if available
+      this._nativeVideoWriter = null;
+      this._nativeVideoLatestFrame = null;
+      this._nativeVideoWriteInFlight = false;
+      this._nativeVideoDroppedFrames = 0;
+      this._nativeVideoLastFrameAgeMs = null;
+      this._nativeVideoMaxFrameAgeMs = 0;
+      this._nativeVideoAgeSampleTotalMs = 0;
+      this._nativeVideoAgeSampleCount = 0;
+      this._nativeVideoLastCaptureEpochMs = null;
+      this._nativeVideoConfig = null;
+      this._signalingSessionInfo = null;
+      this._lastPipelineSnapshot = null;
+      this._lastOutboundResolutionKey = null;
+      this._viewerFrameSizeByViewer = new Map();
+      this._currentCaptureMethod = null;
       this.abr = new AdaptiveQualityController(this);
 
       logger.info('LuminaApp initializing (SFU mode)...');
@@ -959,6 +1033,118 @@ class LuminaApp {
       }
     }
     return Object.keys(clone).length ? clone : null;
+  }
+
+  _logSession(type, payload) {
+    if (window.electron?.sessionLog) {
+      window.electron.sessionLog(type, payload);
+    }
+  }
+
+  _resetNativeFrameTelemetry() {
+    this._nativeVideoLastFrameAgeMs = null;
+    this._nativeVideoMaxFrameAgeMs = 0;
+    this._nativeVideoAgeSampleTotalMs = 0;
+    this._nativeVideoAgeSampleCount = 0;
+    this._nativeVideoLastCaptureEpochMs = null;
+  }
+
+  _recordNativeFrameTelemetry(meta) {
+    const epochTimestampUs = meta?.epochTimestampUs;
+    if (!epochTimestampUs) return null;
+
+    const frameAgeMs = Math.max(0, Date.now() - (epochTimestampUs / 1000));
+    this._nativeVideoLastFrameAgeMs = frameAgeMs;
+    this._nativeVideoMaxFrameAgeMs = Math.max(this._nativeVideoMaxFrameAgeMs || 0, frameAgeMs);
+    this._nativeVideoAgeSampleTotalMs = (this._nativeVideoAgeSampleTotalMs || 0) + frameAgeMs;
+    this._nativeVideoAgeSampleCount = (this._nativeVideoAgeSampleCount || 0) + 1;
+    this._nativeVideoLastCaptureEpochMs = epochTimestampUs / 1000;
+    return frameAgeMs;
+  }
+
+  _getNativeFrameTelemetrySnapshot() {
+    if (!(this._nativeVideoAgeSampleCount > 0)) return null;
+
+    return {
+      lastFrameAgeMs: Number((this._nativeVideoLastFrameAgeMs || 0).toFixed(1)),
+      avgFrameAgeMs: Number((this._nativeVideoAgeSampleTotalMs / this._nativeVideoAgeSampleCount).toFixed(1)),
+      maxFrameAgeMs: Number((this._nativeVideoMaxFrameAgeMs || 0).toFixed(1)),
+      lastCaptureAtIso: this._nativeVideoLastCaptureEpochMs
+        ? new Date(this._nativeVideoLastCaptureEpochMs).toISOString()
+        : null,
+    };
+  }
+
+  _getCurrentSignalingSessionId() {
+    return this._signalingSessionInfo?.sessionId || null;
+  }
+
+  _getCurrentSignalingSessionDirName() {
+    return this._signalingSessionInfo?.sessionDirName || null;
+  }
+
+  _logViewerFrameSizeChange(data) {
+    if (!data?.viewerId || !data.frameWidth || !data.frameHeight) return;
+
+    const nextFrameSize = data.frameWidth + 'x' + data.frameHeight;
+    const previousFrameSize = this._viewerFrameSizeByViewer.get(data.viewerId) || null;
+    if (previousFrameSize === nextFrameSize) return;
+
+    this._viewerFrameSizeByViewer.set(data.viewerId, nextFrameSize);
+
+    const viewer = this.viewers.get(data.viewerId);
+    const capture = this._lastPipelineSnapshot?.capture || null;
+    logger.info('[DIAG:VIEWER-SIZE] ' + (viewer?.name || data.viewerId) + ' ' +
+      (previousFrameSize || '--') + ' -> ' + nextFrameSize +
+      ' while outbound=' + (capture?.outboundWidth || '--') + 'x' + (capture?.outboundHeight || '--') +
+      ' tier=' + this.abr.getStatusText());
+
+    this._logSession('viewer-frame-size-change', {
+      viewerId: data.viewerId,
+      viewerName: viewer?.name || null,
+      previousFrameSize,
+      nextFrameSize,
+      frameWidth: data.frameWidth,
+      frameHeight: data.frameHeight,
+      outboundWidth: capture?.outboundWidth ?? null,
+      outboundHeight: capture?.outboundHeight ?? null,
+      sourceWidth: capture?.sourceWidth ?? null,
+      sourceHeight: capture?.sourceHeight ?? null,
+      abrTier: this.abr.tierIndex,
+      abrLabel: this.abr.currentTier?.label || null,
+      signalingSessionId: data.signalingSessionId || this._getCurrentSignalingSessionId(),
+      signalingSessionDirName: this._getCurrentSignalingSessionDirName(),
+      captureMethod: this._currentCaptureMethod || null,
+    });
+  }
+
+  _logOutboundResolutionChange(capture) {
+    if (!capture?.outboundWidth || !capture?.outboundHeight) return;
+
+    const nextKey = capture.outboundWidth + 'x' + capture.outboundHeight;
+    if (this._lastOutboundResolutionKey === nextKey) return;
+
+    const previousKey = this._lastOutboundResolutionKey;
+    this._lastOutboundResolutionKey = nextKey;
+
+    logger.info('[DIAG:OUTBOUND-SIZE] ' + (previousKey || '--') + ' -> ' + nextKey +
+      ' source=' + (capture.sourceWidth || '--') + 'x' + (capture.sourceHeight || '--') +
+      ' tier=' + this.abr.getStatusText());
+
+    this._logSession('outbound-resolution-change', {
+      previousFrameSize: previousKey,
+      nextFrameSize: nextKey,
+      outboundWidth: capture.outboundWidth,
+      outboundHeight: capture.outboundHeight,
+      sourceWidth: capture.sourceWidth ?? null,
+      sourceHeight: capture.sourceHeight ?? null,
+      sourceFps: capture.sourceFps ?? null,
+      abrTier: this.abr.tierIndex,
+      abrLabel: this.abr.currentTier?.label || null,
+      signalingSessionId: this._getCurrentSignalingSessionId(),
+      signalingSessionDirName: this._getCurrentSignalingSessionDirName(),
+      captureMethod: this._currentCaptureMethod || null,
+    });
   }
 
   _logCaptureTrackDiagnostics(track, context = {}) {
@@ -1065,7 +1251,12 @@ class LuminaApp {
 
   async updateProducerEncoding() {
     const profile = this.getActiveQualityProfile();
-    this.abr.setProfile(profile.maxBitrate, profile.maxFrameRate);
+    this.abr.setProfile(profile.maxBitrate, profile.maxFrameRate, {
+      startTierIndex: profile.startTierIndex,
+      recoverWaitMs: profile.recoverWaitMs,
+      recoverCooldownMs: profile.recoverCooldownMs,
+      startupRampMs: profile.startupRampMs,
+    });
   }
 
   refreshQualityProfileUi() {
@@ -1130,6 +1321,16 @@ class LuminaApp {
     this.socket.on('registered', async (data) => {
       logger.info('Registered as Lumina host — setting up SFU transport');
       try {
+        this._signalingSessionInfo = data.signalingSession || null;
+        if (this._signalingSessionInfo) {
+          logger.info('[SESSION] Bound to signaling session ' + this._signalingSessionInfo.sessionId +
+            ' (' + this._signalingSessionInfo.sessionDirName + ')');
+          this._logSession('signaling-session-bound', {
+            signalingSessionId: this._signalingSessionInfo.sessionId,
+            signalingSessionDirName: this._signalingSessionInfo.sessionDirName || null,
+            signalingStartedAt: this._signalingSessionInfo.startedAt || null,
+          });
+        }
         await this.setupMediasoup(data.routerRtpCapabilities);
         this.showCapturePanel();
         this.loadCaptureSources();
@@ -1168,6 +1369,7 @@ class LuminaApp {
     this.socket.on('viewer-left', (data) => {
       logger.info('Viewer left');
       this.viewers.delete(data.viewerId);
+      this._viewerFrameSizeByViewer.delete(data.viewerId);
       this.abr.removeViewer(data.viewerId);
       this.updateViewersList();
     });
@@ -1183,6 +1385,8 @@ class LuminaApp {
         jitterBufferDelayMs: data.jitterBufferDelayMs || 0,
         decodeLatencyMs: data.decodeLatencyMs || 0,
       });
+
+      this._logViewerFrameSizeChange(data);
 
       if (!this._qrLogCounter) this._qrLogCounter = 0;
       this._qrLogCounter++;
@@ -1330,64 +1534,91 @@ class LuminaApp {
       this._nativeGamePid = gamePid;
       const isWindowCapture = sourceId.startsWith('window:');
 
-      // For games detected as window sources, switch to screen capture (DXGI)
-      // immediately. Chromium's WGC window capture cannot reliably grab
-      // DirectX/Vulkan game surfaces — it often captures the window behind
-      // the game instead.
-      if (isGame && isWindowCapture) {
-        logger.info('[GAME] Window capture unreliable for DX/Vulkan games — switching to screen capture (DXGI)');
-        const screenId = await this._findScreenSource();
-        if (screenId) {
-          sourceId = screenId;
-          this._gameUsedScreenFallback = true;
-        } else {
-          logger.warn('[GAME] No screen source found, falling back to window capture');
+      // ── NATIVE DXGI CAPTURE (preferred for games) ────────────────
+      // Bypasses Chromium's ~30 fps desktop capture bottleneck by using
+      // DXGI Desktop Duplication directly from the native addon.
+      let stream = null;
+      let captureMethod = null;
+
+      if (isGame) {
+        const prof = this.getActiveQualityProfile();
+        stream = await this._startNativeVideoCapture(prof);
+        if (stream) {
+          captureMethod = 'native-dxgi';
+          logger.info('[GAME] Using native DXGI capture — bypassing Chromium getUserMedia');
         }
+      }
+
+      // ── FALLBACK: Chromium getUserMedia ──────────────────────────
+      if (!stream) {
+        // For games detected as window sources, switch to screen capture (DXGI via Chromium)
+        if (isGame && isWindowCapture) {
+          logger.info('[GAME] Window capture unreliable for DX/Vulkan games — switching to screen capture');
+          const screenId = await this._findScreenSource();
+          if (screenId) {
+            sourceId = screenId;
+            this._gameUsedScreenFallback = true;
+          } else {
+            logger.warn('[GAME] No screen source found, falling back to window capture');
+          }
+        }
+
+        if (sourceId.startsWith('window:') && window.electron?.prepareForCapture) {
+          logger.info('Minimizing streamer window before window capture');
+          await window.electron.prepareForCapture();
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
+
+        stream = await this.captureSourceStream(sourceId);
+        captureMethod = this._gameUsedScreenFallback ? 'screen-dxgi-chromium' : (sourceId.startsWith('window:') ? 'window-wgc' : 'screen-dxgi-chromium');
       }
 
       this._lastSourceId = sourceId;
       if (!this._gameUsedScreenFallback) this._gameUsedScreenFallback = false;
 
-      if (sourceId.startsWith('window:') && window.electron?.prepareForCapture) {
-        logger.info('Minimizing streamer window before window capture');
-        await window.electron.prepareForCapture();
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-
-      const stream = await this.captureSourceStream(sourceId);
-
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.contentHint = 'motion';
         const settings = videoTrack.getSettings();
+        const nativeConfig = this._nativeVideoConfig || null;
         this.captureProfile = {
-          width: settings.width || 1280,
-          height: settings.height || 720,
-          frameRate: settings.frameRate || 60
+          width: settings.width || nativeConfig?.width || 1280,
+          height: settings.height || nativeConfig?.height || 720,
+          frameRate: settings.frameRate || nativeConfig?.targetFps || 60
         };
         const prof = this.getActiveQualityProfile();
+        this.abr.setProfile(prof.maxBitrate, prof.maxFrameRate, {
+          startTierIndex: prof.startTierIndex,
+          recoverWaitMs: prof.recoverWaitMs,
+          recoverCooldownMs: prof.recoverCooldownMs,
+          startupRampMs: prof.startupRampMs,
+        });
+        const initialBitrate = this.abr.effectiveBitrate;
+        const initialFps = this.abr.effectiveFps;
+        const initialScaleDown = this.abr.currentTier.scaleDown;
+        this._currentCaptureMethod = captureMethod || 'unknown';
         logger.info(
           '[DIAG:CAPTURE] actual=' + settings.width + 'x' + settings.height + '@' + Math.round(settings.frameRate || 60) + 'fps' +
           ' | profile=' + prof.label + ' maxRes=' + prof.maxWidth + 'x' + prof.maxHeight +
           ' maxBitrate=' + (prof.maxBitrate / 1000000) + 'Mbps' +
           (isGame ? ' | GAME-OPTIMISED' : '')
         );
-
-        // Init ABR with profile ceiling
-        this.abr.setProfile(prof.maxBitrate, prof.maxFrameRate);
+        logger.info('[ABR] Starting at ' + this.abr.getStatusText() + ' for conservative warm-up');
 
         // Produce video via SFU transport (single encoder for ALL viewers!)
         this.videoProducer = await this.sendTransport.produce({
           track: videoTrack,
           encodings: [{
-            maxBitrate: prof.maxBitrate,
-            maxFramerate: prof.maxFrameRate,
-            scaleResolutionDownBy: 1.0,
+            maxBitrate: initialBitrate,
+            maxFramerate: initialFps,
+            scaleResolutionDownBy: initialScaleDown,
           }],
           codecOptions: {
-            videoGoogleStartBitrate: Math.round(prof.startBitrate / 1000),
+            videoGoogleStartBitrate: Math.round(Math.min(prof.startBitrate, initialBitrate) / 1000),
           },
         });
+
+        this.abr._applyTier();
 
         logger.info('[SFU] Video producer created (id: ' + this.videoProducer.id + ')');
 
@@ -1474,7 +1705,10 @@ class LuminaApp {
         window.electron.sessionLog('stream-start', {
           sourceId, sourceName, isGame, gameHwnd, gamePid, gameProcess, classificationReason,
           profile: this.captureProfile,
-          captureMethod: this._gameUsedScreenFallback ? 'screen-dxgi' : (sourceId.startsWith('window:') ? 'window-wgc' : 'screen'),
+          captureMethod: captureMethod || 'unknown',
+          nativeVideoFrameCount: this._nativeVideoFrameCount || 0,
+          signalingSessionId: this._getCurrentSignalingSessionId(),
+          signalingSessionDirName: this._getCurrentSignalingSessionDirName(),
         });
       }
 
@@ -1558,6 +1792,232 @@ class LuminaApp {
     }
   }
 
+  // ─────────────── Native DXGI Video Capture ───────────────
+  // Bypasses Chromium's getUserMedia desktop capture (which is limited to
+  // ~30-35 fps on current Electron/Chromium builds) by using DXGI Desktop
+  // Duplication directly from the native addon.  Frames are delivered via
+  // IPC and assembled into a MediaStreamTrack for WebRTC.
+
+  /**
+   * Starts native DXGI capture and returns a MediaStream with a video track
+   * driven by frame data from the native addon.  Returns null if native
+   * capture is unavailable or fails to start.
+   */
+  async _startNativeVideoCapture(profile) {
+    if (!window.electron?.isNativeVideoCaptureAvailable) {
+      logger.warn('[NATIVE-VIDEO] API not exposed in preload');
+      return null;
+    }
+
+    const available = await window.electron.isNativeVideoCaptureAvailable();
+    if (!available) {
+      logger.warn('[NATIVE-VIDEO] Native video capture not available (addon not built?)');
+      return null;
+    }
+
+    const targetFps = profile?.maxFrameRate || profile?.frameRate || 60;
+    const maxWidth = profile?.nativeMaxWidth || profile?.maxWidth || profile?.width || 1920;
+    const maxHeight = profile?.nativeMaxHeight || profile?.maxHeight || profile?.height || 1080;
+    const result = await window.electron.startNativeVideoCapture({ fps: targetFps, maxWidth, maxHeight });
+    if (!result || !result.success) {
+      logger.warn('[NATIVE-VIDEO] Start failed: ' + (result?.reason || 'unknown'));
+      return null;
+    }
+
+    const { width, height } = result;
+    this._nativeVideoConfig = { width, height, targetFps, maxWidth, maxHeight };
+    logger.info('[NATIVE-VIDEO] DXGI capture started: ' + width + 'x' + height + ' target=' + targetFps + 'fps');
+
+    // ── Path A: VideoFrame + MediaStreamTrackGenerator (zero-copy BGRA) ──
+    if (typeof MediaStreamTrackGenerator !== 'undefined') {
+      try {
+        const generator = new MediaStreamTrackGenerator({ kind: 'video' });
+        const writer = generator.writable.getWriter();
+        this._nativeVideoGenerator = generator;
+        this._nativeVideoWriter = writer;
+        this._nativeVideoActive = true;
+        this._nativeVideoFrameCount = 0;
+        this._nativeVideoLatestFrame = null;
+        this._nativeVideoWriteInFlight = false;
+        this._nativeVideoDroppedFrames = 0;
+        this._resetNativeFrameTelemetry();
+
+        const pumpFrames = async () => {
+          if (this._nativeVideoWriteInFlight || !this._nativeVideoActive) return;
+          this._nativeVideoWriteInFlight = true;
+          try {
+            while (this._nativeVideoActive && this._nativeVideoLatestFrame) {
+              const nextFrame = this._nativeVideoLatestFrame;
+              this._nativeVideoLatestFrame = null;
+              let frame = null;
+              try {
+                this._recordNativeFrameTelemetry(nextFrame.meta);
+                frame = new VideoFrame(new Uint8Array(nextFrame.buffer), {
+                  format: 'BGRA',
+                  codedWidth: nextFrame.meta.width,
+                  codedHeight: nextFrame.meta.height,
+                  timestamp: Math.round(nextFrame.meta.timestamp),
+                });
+                await writer.write(frame);
+                this._nativeVideoFrameCount++;
+                if (this._nativeVideoFrameCount === 1) {
+                  logger.info('[NATIVE-VIDEO] First VideoFrame written: ' +
+                    nextFrame.meta.width + 'x' + nextFrame.meta.height);
+                }
+              } catch (e) {
+                logger.warn('[NATIVE-VIDEO] VideoFrame error: ' + e.message);
+              } finally {
+                if (frame) frame.close();
+              }
+            }
+          } finally {
+            this._nativeVideoWriteInFlight = false;
+            if (this._nativeVideoActive && this._nativeVideoLatestFrame) {
+              queueMicrotask(() => { pumpFrames(); });
+            }
+          }
+        };
+
+        window.electron.onGameVideoFrame((buffer, meta) => {
+          if (!this._nativeVideoActive) return;
+          if (this._nativeVideoLatestFrame) {
+            this._nativeVideoDroppedFrames++;
+          }
+          this._nativeVideoLatestFrame = { buffer, meta };
+          pumpFrames();
+        });
+
+        const stream = new MediaStream([generator]);
+        this._nativeVideoStream = stream;
+
+        if (window.electron?.sessionLog) {
+          window.electron.sessionLog('native-video-started', {
+            width, height, targetFps, maxWidth, maxHeight, method: 'MediaStreamTrackGenerator',
+          });
+        }
+
+        logger.info('[NATIVE-VIDEO] Using MediaStreamTrackGenerator pipeline');
+        return stream;
+      } catch (e) {
+        logger.warn('[NATIVE-VIDEO] MediaStreamTrackGenerator failed, trying canvas fallback: ' + e.message);
+        this._nativeVideoGenerator = null;
+        this._nativeVideoWriter = null;
+      }
+    }
+
+    // ── Path B: Canvas + captureStream (universal fallback) ──
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.style.display = 'none';
+    document.body.appendChild(canvas);
+    this._nativeVideoCanvas = canvas;
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: false });
+    this._nativeVideoCtx = ctx;
+    this._nativeVideoActive = true;
+    this._nativeVideoFrameCount = 0;
+    this._nativeVideoDroppedFrames = 0;
+    this._resetNativeFrameTelemetry();
+
+    window.electron.onGameVideoFrame((buffer, meta) => {
+      if (!this._nativeVideoActive || !this._nativeVideoCtx) return;
+      try {
+        this._recordNativeFrameTelemetry(meta);
+        // BGRA → RGBA byte swap (DXGI delivers BGRA, ImageData expects RGBA)
+        const u8 = new Uint8Array(buffer);
+        const u32 = new Uint32Array(u8.buffer);
+        for (let i = 0; i < u32.length; i++) {
+          const v = u32[i];
+          u32[i] = (v & 0xFF00FF00) | ((v & 0x000000FF) << 16) | ((v & 0x00FF0000) >>> 16);
+        }
+        const imageData = new ImageData(
+          new Uint8ClampedArray(u8.buffer),
+          meta.width,
+          meta.height
+        );
+        this._nativeVideoCtx.putImageData(imageData, 0, 0);
+        this._nativeVideoFrameCount++;
+        if (this._nativeVideoFrameCount === 1) {
+          logger.info('[NATIVE-VIDEO] First canvas frame painted: ' +
+            meta.width + 'x' + meta.height);
+        }
+      } catch (e) {
+        if (this._nativeVideoFrameCount < 3) {
+          logger.warn('[NATIVE-VIDEO] Canvas paint error: ' + e.message);
+        }
+      }
+    });
+
+    const stream = canvas.captureStream(targetFps);
+    this._nativeVideoStream = stream;
+
+    if (window.electron?.sessionLog) {
+      window.electron.sessionLog('native-video-started', {
+        width, height, targetFps, maxWidth, maxHeight, method: 'canvas-captureStream',
+      });
+    }
+
+    logger.info('[NATIVE-VIDEO] Using canvas captureStream pipeline (' + width + 'x' + height + '@' + targetFps + ')');
+    return stream;
+  }
+
+  /**
+   * Tears down native video capture: stops the addon, removes listeners,
+   * cleans up canvas/generator.
+   */
+  async _stopNativeVideoCapture() {
+    this._nativeVideoActive = false;
+    this._nativeVideoLatestFrame = null;
+    this._nativeVideoWriteInFlight = false;
+
+    if (window.electron?.removeGameVideoFrameListener) {
+      window.electron.removeGameVideoFrameListener();
+    }
+
+    if (window.electron?.stopNativeVideoCapture) {
+      try {
+        await window.electron.stopNativeVideoCapture();
+      } catch (e) {
+        logger.warn('[NATIVE-VIDEO] Stop error: ' + e.message);
+      }
+    }
+
+    if (this._nativeVideoWriter) {
+      try { this._nativeVideoWriter.close(); } catch (_) {}
+      this._nativeVideoWriter = null;
+    }
+    this._nativeVideoGenerator = null;
+    this._nativeVideoConfig = null;
+
+    if (this._nativeVideoStream) {
+      this._nativeVideoStream.getTracks().forEach(t => t.stop());
+      this._nativeVideoStream = null;
+    }
+
+    if (this._nativeVideoCanvas) {
+      this._nativeVideoCanvas.remove();
+      this._nativeVideoCanvas = null;
+      this._nativeVideoCtx = null;
+    }
+
+    const frames = this._nativeVideoFrameCount;
+    this._nativeVideoFrameCount = 0;
+
+    if (frames > 0) {
+      logger.info('[NATIVE-VIDEO] Stopped after ' + frames + ' frames');
+      if (window.electron?.sessionLog) {
+        window.electron.sessionLog('native-video-stopped', {
+          framesDelivered: frames,
+          framesDropped: this._nativeVideoDroppedFrames || 0,
+          frameAge: this._getNativeFrameTelemetrySnapshot(),
+        });
+      }
+    }
+    this._nativeVideoDroppedFrames = 0;
+    this._resetNativeFrameTelemetry();
+  }
+
   /**
    * Finds the primary screen source from the cached source list.
    * Used for game capture — screen capture (DXGI Desktop Duplication)
@@ -1619,6 +2079,19 @@ class LuminaApp {
           this.abr.updateProducerStats({ bitrateMbps, fps });
         }
 
+        if (pipelineStats.mediaSource || pipelineStats.track || pipelineStats.outbound) {
+          this._lastPipelineSnapshot = {
+            capture: {
+              sourceFps: pipelineStats.mediaSource?.framesPerSecond ?? pipelineStats.track?.framesPerSecond ?? null,
+              sourceWidth: pipelineStats.mediaSource?.frameWidth ?? pipelineStats.track?.frameWidth ?? null,
+              sourceHeight: pipelineStats.mediaSource?.frameHeight ?? pipelineStats.track?.frameHeight ?? null,
+              outboundWidth: pipelineStats.outbound?.frameWidth ?? null,
+              outboundHeight: pipelineStats.outbound?.frameHeight ?? null,
+            },
+          };
+          this._logOutboundResolutionChange(this._lastPipelineSnapshot.capture);
+        }
+
         // Periodic stats snapshot (every 5s)
         if (bitrateMbps !== null && window.electron?.sessionLog) {
           this._statsTickCount = (this._statsTickCount || 0) + 1;
@@ -1644,7 +2117,14 @@ class LuminaApp {
                 availableOutgoingBitrateMbps: pipelineStats.candidatePair?.availableOutgoingBitrate != null
                   ? +(pipelineStats.candidatePair.availableOutgoingBitrate / 1000000).toFixed(2)
                   : null,
+                nativeDroppedFrames: this._nativeVideoDroppedFrames || 0,
+                nativeCapture: this._nativeVideoActive || false,
+                nativeFrameCount: this._nativeVideoFrameCount || 0,
               };
+              const nativeFrameAge = this._getNativeFrameTelemetrySnapshot();
+              if (nativeFrameAge) {
+                snapshot.capture.nativeFrameAge = nativeFrameAge;
+              }
             }
             // Include server BWE metrics if available
             const bwe = this.abr._serverBwe;
@@ -1879,9 +2359,15 @@ class LuminaApp {
     this._stopSourceHealthCheck();
     if (this._gameFallbackTimer) { clearTimeout(this._gameFallbackTimer); this._gameFallbackTimer = null; }
     this._teardownNativeGameAudio();
+    this._stopNativeVideoCapture();
     this._isGameCapture = false;
     this._nativeGamePid = null;
-    this.abr.tierIndex = 0;
+    this.abr.tierIndex = this.abr.startupTierIndex;
+    this._lastPipelineSnapshot = null;
+    this._lastOutboundResolutionKey = null;
+    this._viewerFrameSizeByViewer.clear();
+    this._currentCaptureMethod = null;
+    this._resetNativeFrameTelemetry();
 
     if (this.videoProducer) {
       this.videoProducer.close();

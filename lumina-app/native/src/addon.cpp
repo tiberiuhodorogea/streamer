@@ -10,6 +10,7 @@
 #include <napi.h>
 #include "game_detect.h"
 #include "process_audio.h"
+#include "game_video.h"
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("enumGameWindows",
@@ -26,6 +27,19 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
     exports.Set("registerAudioCallback",
         Napi::Function::New(env, process_audio::RegisterAudioCallback));
+
+    // Native video capture (DXGI Desktop Duplication)
+    exports.Set("startVideoCapture",
+        Napi::Function::New(env, game_video::StartCapture));
+
+    exports.Set("stopVideoCapture",
+        Napi::Function::New(env, game_video::StopCapture));
+
+    exports.Set("registerVideoCallback",
+        Napi::Function::New(env, game_video::RegisterVideoCallback));
+
+    exports.Set("isVideoCapturing",
+        Napi::Function::New(env, game_video::IsCapturing));
 
     return exports;
 }

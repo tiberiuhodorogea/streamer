@@ -85,7 +85,7 @@ Signaling URL:
 - The streamer supports screen and window capture, with optional process-audio support through the native addon.
 - The viewer and streamer both use a bundled `mediasoup-client` browser build.
 - Session logs are written under `logs/sessions/`.
-- The baseline summaries under `logs/baselines/` look like analysis artifacts, not runtime dependencies.
+- The active comparison baseline lives in `logs/baselines/2026-04-05-active-baseline-summary.json` and is sourced from the retained session `2026-04-05T06-20-16-832Z-d08f5dd`.
 
 ## License
 

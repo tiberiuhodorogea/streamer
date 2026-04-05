@@ -1,0 +1,26 @@
+{
+  "label": "Active baseline after stale-viewer fix",
+  "date": "2026-04-05",
+  "commit": "d08f5dd",
+  "sessionDir": "2026-04-05T06-20-16-832Z-d08f5dd",
+  "sessionDurationSec": 174.6,
+  "refreshRequiredCount": 1,
+  "viewerBuildId": "viewer-sfu-3",
+  "streamer": {
+    "bitrateMbps": { "avg": 9.65, "min": 2.4, "max": 12.64 },
+    "fps": { "avg": 57.8, "min": 44, "max": 60 }
+  },
+  "viewer": {
+    "bitrateMbps": { "avg": 9.79, "min": 0.31, "max": 14.44 },
+    "fps": { "avg": 57.74, "min": 36, "max": 73 },
+    "jitterBufferDelayMs": { "avg": 71.22, "min": 8.5, "max": 82.3 },
+    "decodeLatencyMs": { "avg": 6.04, "min": 4.4, "max": 7.3 }
+  },
+  "notes": [
+    "This session is the retained comparison point for future tuning runs.",
+    "The stale viewer was rejected once, then rejoined with viewer build provenance populated.",
+    "The stream upgraded to FULL and held 1600x900 without any ABR degrade.",
+    "Native capture stayed healthy with zero queue drops.",
+    "The remaining quality gap is receiver-side buffering: the viewer jitter buffer climbed into the mid/high-70 ms range and did not drain."
+  ]
+}

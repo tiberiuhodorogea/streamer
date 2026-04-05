@@ -188,7 +188,10 @@ class DebugConsole {
 }
 
 const debugConsole = new DebugConsole();
-const VIEWER_BUILD_ID = 'viewer-sfu-2';
+const VIEWER_BUILD_ID = 'viewer-sfu-3';
+const RELOAD_STATE_KEY = 'lumina.viewer.reloadState';
+const RELOAD_STATE_MAX_AGE_MS = 5 * 60 * 1000;
+const MAX_AUTO_REFRESH_ATTEMPTS = 2;
 
 window.addEventListener('error', (event) => {
   debugConsole.error('Window error: ' + event.message);
@@ -222,6 +225,7 @@ class ViewerApp {
     this._recoveringActiveStream = false;
     this._transportRecoveryTimer = null;
     this._localTransportClose = false;
+    this._restoreAutoConnect = false;
     // Stats tracking
     this._prevBytesReceived = 0;
     this._prevFramesDecoded = 0;
@@ -230,6 +234,10 @@ class ViewerApp {
     this.prefillServerUrl();
     this.initializeUI();
     debugConsole.info('Viewer app initialized (SFU mode) build=' + VIEWER_BUILD_ID + ' loadedAt=' + this._pageLoadedAtIso);
+    this.restoreReloadState();
+    if (this._restoreAutoConnect) {
+      setTimeout(() => this.connect(), 0);
+    }
   }
 
   prefillServerUrl() {
@@ -261,6 +269,99 @@ class ViewerApp {
     document.addEventListener('fullscreenchange', () => this.syncFullscreenButton());
     document.addEventListener('webkitfullscreenchange', () => this.syncFullscreenButton());
     this.syncStatsOverlay();
+  }
+
+  getViewerIdentityPayload() {
+    return {
+      viewerBuildId: VIEWER_BUILD_ID,
+      pageLoadedAtIso: this._pageLoadedAtIso,
+    };
+  }
+
+  restoreReloadState() {
+    try {
+      const rawState = window.sessionStorage.getItem(RELOAD_STATE_KEY);
+      if (!rawState) return;
+
+      const state = JSON.parse(rawState);
+      const savedAtMs = Number(state?.savedAtMs || 0);
+      if (!savedAtMs || (Date.now() - savedAtMs) > RELOAD_STATE_MAX_AGE_MS) {
+        window.sessionStorage.removeItem(RELOAD_STATE_KEY);
+        return;
+      }
+
+      if (state.serverUrl) {
+        document.getElementById('serverUrl').value = state.serverUrl;
+      }
+      if (state.viewerName) {
+        document.getElementById('viewerName').value = state.viewerName;
+      }
+      if (state.selectedLumina) {
+        this.selectedLumina = state.selectedLumina;
+        this.selectedLuminaName = state.selectedLuminaName || state.selectedLumina;
+        this._pendingStreamRecovery = true;
+        document.getElementById('streamTitle').textContent = this.selectedLuminaName;
+        document.getElementById('connectionQuality').textContent = 'Refreshing';
+        this.setOverlayState('Refreshing');
+      }
+
+      this._restoreAutoConnect = true;
+      debugConsole.warn('Restoring viewer after forced refresh: ' + (state.reason || 'stale viewer detected'));
+    } catch (error) {
+      window.sessionStorage.removeItem(RELOAD_STATE_KEY);
+      debugConsole.warn('Could not restore forced refresh state: ' + error.message);
+    }
+  }
+
+  clearReloadState() {
+    this._restoreAutoConnect = false;
+    window.sessionStorage.removeItem(RELOAD_STATE_KEY);
+  }
+
+  persistReloadState(reason, requiredBuildId) {
+    let attempts = 1;
+
+    try {
+      const previousRaw = window.sessionStorage.getItem(RELOAD_STATE_KEY);
+      if (previousRaw) {
+        const previousState = JSON.parse(previousRaw);
+        const previousSavedAtMs = Number(previousState?.savedAtMs || 0);
+        if (previousSavedAtMs && (Date.now() - previousSavedAtMs) <= RELOAD_STATE_MAX_AGE_MS) {
+          attempts = Number(previousState?.attempts || 0) + 1;
+        }
+      }
+    } catch {}
+
+    window.sessionStorage.setItem(RELOAD_STATE_KEY, JSON.stringify({
+      attempts,
+      savedAtMs: Date.now(),
+      reason,
+      requiredBuildId: requiredBuildId || null,
+      serverUrl: this.getServerUrl(),
+      viewerName: document.getElementById('viewerName').value.trim(),
+      selectedLumina: this.selectedLumina || null,
+      selectedLuminaName: this.selectedLuminaName || null,
+    }));
+
+    return attempts;
+  }
+
+  handleViewerRefreshRequired(data) {
+    const requiredBuildId = data?.requiredBuildId || VIEWER_BUILD_ID;
+    const message = data?.message || 'Viewer refresh required to load the latest client build.';
+    const attempts = this.persistReloadState(message, requiredBuildId);
+
+    if (attempts > MAX_AUTO_REFRESH_ATTEMPTS) {
+      this.clearReloadState();
+      this.showError(message + ' Please refresh the viewer page manually.');
+      return;
+    }
+
+    debugConsole.warn(message + ' Reloading viewer now.');
+    const reloadUrl = new URL(window.location.href);
+    reloadUrl.searchParams.set('viewerBuild', requiredBuildId);
+    reloadUrl.searchParams.set('reloadTs', String(Date.now()));
+    window.location.replace(reloadUrl.toString());
   }
 
   getServerUrl() {
@@ -353,6 +454,7 @@ class ViewerApp {
     this.socket.emit('join-streamer', {
       streamerId: this.selectedLumina,
       viewerName,
+      ...this.getViewerIdentityPayload(),
     });
   }
 
@@ -441,6 +543,10 @@ class ViewerApp {
       this.loadAvailableStreams();
     });
 
+    this.socket.on('viewer-refresh-required', (data) => {
+      this.handleViewerRefreshRequired(data);
+    });
+
     // SFU: after joining a streamer, we get router capabilities
     this.socket.on('joined', async (data) => {
       debugConsole.info('[SFU] Joined room — setting up consumer transport');
@@ -456,6 +562,7 @@ class ViewerApp {
         this._recoveringActiveStream = false;
         this.setOverlayState('Live');
         this.setStatus('Connected', 'green');
+        this.clearReloadState();
       } catch (error) {
         this._recoveringActiveStream = false;
         debugConsole.error('SFU setup failed: ' + error.message);
@@ -566,7 +673,8 @@ class ViewerApp {
 
     this.socket.emit('join-streamer', {
       streamerId: streamer.id,
-      viewerName
+      viewerName,
+      ...this.getViewerIdentityPayload(),
     });
 
     this.hideStreamsPanel();

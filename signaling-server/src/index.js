@@ -16,6 +16,7 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..');
+const CURRENT_VIEWER_BUILD_ID = 'viewer-sfu-3';
 
 // ============================================
 // SESSION LOGGING
@@ -611,9 +612,39 @@ async function handleViewerJoin(clientId, data, ws) {
   const streamerId = data?.streamerId;
   const viewerName = String(data?.viewerName || clientId).substring(0, 64);
   const room = rooms.get(streamerId);
+  const viewerBuildId = typeof data?.viewerBuildId === 'string' ? data.viewerBuildId.substring(0, 64) : null;
+  const pageLoadedAtIso = typeof data?.pageLoadedAtIso === 'string' ? data.pageLoadedAtIso : null;
 
   if (!room) {
     send(ws, 'error', { message: 'Host not found' });
+    return;
+  }
+
+  if (viewerBuildId !== CURRENT_VIEWER_BUILD_ID) {
+    const refreshReason = viewerBuildId ? 'viewer-build-mismatch' : 'viewer-build-missing';
+    const refreshMessage = viewerBuildId
+      ? 'Viewer build ' + viewerBuildId + ' is stale. Reloading to ' + CURRENT_VIEWER_BUILD_ID + '.'
+      : 'Viewer build metadata is missing. Reload the viewer page to continue.';
+
+    appendSessionLog('viewer-refresh-required', {
+      clientId,
+      viewerName,
+      streamerId,
+      signalingSessionId: sessionId,
+      viewerBuildId,
+      expectedViewerBuildId: CURRENT_VIEWER_BUILD_ID,
+      pageLoadedAtIso,
+      reason: refreshReason,
+    });
+
+    console.warn('[SFU] Refresh required for viewer ' + viewerName + ': ' + refreshReason);
+    send(ws, 'viewer-refresh-required', {
+      reason: refreshReason,
+      message: refreshMessage,
+      requiredBuildId: CURRENT_VIEWER_BUILD_ID,
+      signalingSessionId: sessionId,
+    });
+    send(ws, 'error', { message: 'Viewer refresh required. Reload the viewer page to continue.' });
     return;
   }
 
@@ -645,6 +676,8 @@ async function handleViewerJoin(clientId, data, ws) {
     id: clientId,
     ws,
     name: viewerName,
+    viewerBuildId,
+    pageLoadedAtIso,
     consumerTransport: null,
     consumers: new Map(),
     latestQualityReport: null,
@@ -657,12 +690,20 @@ async function handleViewerJoin(clientId, data, ws) {
   if (currentViewerCount > sessionStats.peakViewerCount) {
     sessionStats.peakViewerCount = currentViewerCount;
   }
-  appendSessionLog('viewer-joined', { clientId, viewerName, streamerId, currentViewerCount });
+  appendSessionLog('viewer-joined', {
+    clientId,
+    viewerName,
+    streamerId,
+    currentViewerCount,
+    viewerBuildId,
+    pageLoadedAtIso,
+  });
 
   send(ws, 'joined', {
     routerRtpCapabilities: room.router.rtpCapabilities,
     streamerId,
     signalingSession: getCurrentSessionInfo(),
+    requiredViewerBuildId: CURRENT_VIEWER_BUILD_ID,
   });
 }
 
@@ -1062,8 +1103,8 @@ function handleViewerQualityReport(clientId, data) {
     signalingSessionId: sessionId,
     viewerSignalingSessionId: data.signalingSessionId || null,
     viewerReportedAtIso: data.reportedAtIso || null,
-    viewerBuildId: data.viewerBuildId || null,
-    pageLoadedAtIso: data.pageLoadedAtIso || null,
+    viewerBuildId: data.viewerBuildId || viewer?.viewerBuildId || null,
+    pageLoadedAtIso: data.pageLoadedAtIso || viewer?.pageLoadedAtIso || null,
     fps: data.fps,
     bitrateMbps: data.bitrateMbps,
     frameWidth: data.frameWidth,

@@ -135,6 +135,8 @@ Runtime artifacts are stored under `logs/`.
 - `logs/sessions/`: per-run JSON and JSONL outputs from signaling and streamer processes
 - `logs/baselines/`: analysis snapshots used for comparison work
 
+The current retained comparison point is `logs/baselines/2026-04-05-active-baseline-summary.json`, sourced from session `2026-04-05T06-20-16-832Z-d08f5dd`.
+
 Streaming changes are expected to preserve and extend telemetry. The current tuning workflow relies on raw JSONL events, session summaries, bottleneck-viewer transitions, encoder or source-stall events, and ABR decision logs to validate any change in adaptation behavior.
 
 These logs are operational artifacts. They are useful during tuning but not part of the minimum code surface needed to understand or run the project.

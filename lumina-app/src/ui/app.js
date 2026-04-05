@@ -337,19 +337,22 @@ class AdaptiveQualityController {
 
     this.jitterWarnMs = 55;
     this.jitterCriticalMs = 85;
-    this.jitterBufferWarnMs = 105;
-    this.jitterBufferCriticalMs = 145;
+    // Native DXGI capture produces avg ~100 ms jitter-buffer at the receiver
+    // (vs ~50 ms for screen-capture streams). Thresholds are calibrated for
+    // native DXGI so the ABR doesn't false-warn on normal operation.
+    this.jitterBufferWarnMs = 145;
+    this.jitterBufferCriticalMs = 200;
     this.jitterBufferGrowthWarnMs = 4.0;
     this.jitterBufferGrowthCriticalMs = 10.0;
-    this.sustainedJitterBufferWarnMs = 85;
-    this.sustainedJitterBufferCriticalMs = 110;
+    this.sustainedJitterBufferWarnMs = 110;
+    this.sustainedJitterBufferCriticalMs = 155;
     this.decodeLatencyWarnMs = 18;
     this.decodeLatencyCriticalMs = 30;
     this.lossWarnRate = 0.03;
     this.lossCriticalRate = 0.06;
     this.recoveryProbeMs = 12000;
-    this.recoveryJitterBufferMaxMs = 85;
-    this.fullRecoveryJitterBufferMaxMs = 60;
+    this.recoveryJitterBufferMaxMs = 135; // native DXGI steady-state ~100 ms
+    this.fullRecoveryJitterBufferMaxMs = 120; // native DXGI steady-state ~100 ms
     this.fullRecoveryJitterBufferDeltaMaxMs = 0.75;
     this.playoutDeltaWarnToleranceMs = 180;
     this.playoutDeltaCriticalToleranceMs = 260;
@@ -692,15 +695,23 @@ class AdaptiveQualityController {
       }
     }
 
-    if (this.tierIndex === this.tiers.length - 1) {
+    // Recovery probe: force a step-up if stuck at a degraded tier past the probe timeout.
+    // Fires at LAST (always) or at any tier >1 below the startup tier (RESCUE and below),
+    // using twice the normal probe interval so it only kicks in as a deadlock-breaker.
+    const isStuckAtMin = this.tierIndex === this.tiers.length - 1;
+    const isStuckDeep = this.tierIndex >= this.startupTierIndex + 3;
+    if (isStuckAtMin || isStuckDeep) {
       if (!this._stuckAtMinSince) {
         this._stuckAtMinSince = now;
-      } else if (now - this._stuckAtMinSince >= this.recoveryProbeMs &&
-                 assessment.state !== 'critical' && assessment.state !== 'encoder-stall') {
-        logger.info('[ABR] Recovery probe — stuck at LAST for ' +
-          ((now - this._stuckAtMinSince) / 1000).toFixed(0) + 's, trying step up');
-        this._stepUp(1, assessment);
-        this._stuckAtMinSince = now;
+      } else {
+        const probeMs = isStuckAtMin ? this.recoveryProbeMs : this.recoveryProbeMs * 2;
+        if (now - this._stuckAtMinSince >= probeMs &&
+            assessment.state !== 'critical' && assessment.state !== 'encoder-stall') {
+          logger.info('[ABR] Recovery probe — stuck at ' + this.currentTier.label + ' for ' +
+            ((now - this._stuckAtMinSince) / 1000).toFixed(0) + 's, trying step up');
+          this._stepUp(1, assessment);
+          this._stuckAtMinSince = now;
+        }
       }
     } else {
       this._stuckAtMinSince = 0;
@@ -963,7 +974,18 @@ class AdaptiveQualityController {
       const agg = bwe.aggregate;
       currentMbps = Math.max(currentMbps, agg.medianDeliveryMbps || 0, agg.minAvailableMbps || 0);
       if ((agg.lowHeadroomViewers || 0) > 0 && (agg.bottleneckStreak || 0) >= 2) {
-        return false;
+        // lowHeadroomViewers fires whenever delivery < 5 Mbps, which is always true
+        // when at RESCUE/SHIELD tiers. Only block recovery when available bandwidth
+        // is actually insufficient for the next tier — not just because the current
+        // tier's delivery is below a fixed 5 Mbps floor.
+        const availMbps = agg.minAvailableMbps || 0;
+        if (!availMbps || availMbps < neededMbps * 1.3) {
+          if (this._evalCounter % 3 === 0) {
+            logger.debug('[ABR] Recovery gated: low-headroom streak=' + agg.bottleneckStreak +
+              ' avail=' + availMbps.toFixed(1) + 'Mbps needed=' + neededMbps.toFixed(1) + 'Mbps');
+          }
+          return false;
+        }
       }
     }
 

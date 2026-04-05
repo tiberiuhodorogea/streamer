@@ -2378,22 +2378,29 @@ class LuminaApp {
         this._resetNativeFrameTelemetry();
         this._lastNativeRendererBackpressureLogAtMs = 0;
 
+        // MessageChannel fires as a task-queue job, not tied to display vsync.
+        // requestAnimationFrame caps the pump to the display refresh rate and
+        // defers during renderer-thread pauses, causing mainToRendererMs spikes
+        // and limiting source-FPS delivery from high-FPS games to ~display-Hz.
+        const { port1: _pumpPort1, port2: _pumpPort2 } = new MessageChannel();
+        this._nativePumpPort1 = _pumpPort1;
+        this._nativePumpPort2 = _pumpPort2;
+        // Target frame interval and staleness threshold
+        const _frameIntervalMs = 1000 / targetFps;      // e.g. 16.67ms at 60fps
+        const _maxFrameAgeMs = _frameIntervalMs * 2.5;  // ~41ms at 60fps
+        let _lastFrameWrittenAtMs = 0;
+
         const schedulePump = () => {
           if (this._nativeVideoPumpScheduled || this._nativeVideoWriteInFlight || !this._nativeVideoActive || !this._nativeVideoLatestFrame) {
             return;
           }
-
           this._nativeVideoPumpScheduled = true;
-          const runPump = () => {
-            this._nativeVideoPumpScheduled = false;
-            pumpFrames();
-          };
+          _pumpPort2.postMessage('');
+        };
 
-          if (typeof requestAnimationFrame === 'function') {
-            requestAnimationFrame(() => runPump());
-          } else {
-            setTimeout(runPump, 0);
-          }
+        _pumpPort1.onmessage = () => {
+          this._nativeVideoPumpScheduled = false;
+          pumpFrames();
         };
 
         const pumpFrames = async () => {
@@ -2408,6 +2415,26 @@ class LuminaApp {
               if (!nextFrame) break;
 
               this._nativeVideoLatestFrame = null;
+
+              // Drop stale frames: if this frame sat in the pipeline longer than
+              // 2.5× the target interval the encoder would encode frozen content.
+              // This keeps ABR and encoder health signals honest after a stall.
+              const _frameAgeMs = Date.now() - (nextFrame.receivedAtEpochMs ?? Date.now());
+              if (_frameAgeMs > _maxFrameAgeMs) {
+                this._nativeVideoDroppedFrames++;
+                continue;
+              }
+
+              // Pace output to targetFps: the capture source delivers at the
+              // game's frame rate (e.g. 120 fps). Writing every frame would
+              // double the encoder load with no quality benefit.
+              const _sinceLast = performance.now() - _lastFrameWrittenAtMs;
+              if (_lastFrameWrittenAtMs > 0 && _sinceLast < _frameIntervalMs * 0.8) {
+                this._nativeVideoLatestFrame = nextFrame; // put back for next turn
+                setTimeout(schedulePump, Math.ceil(_frameIntervalMs * 0.8 - _sinceLast));
+                break;
+              }
+
               let frame = null;
               let writeDurationMs = null;
               try {
@@ -2429,6 +2456,7 @@ class LuminaApp {
                 const writeStartedPerf = performance.now();
                 await writer.write(frame);
                 writeDurationMs = Math.max(0, performance.now() - writeStartedPerf);
+                _lastFrameWrittenAtMs = performance.now();
                 const submitMs = nextFrame.meta?.epochTimestampUs
                   ? Math.max(0, Date.now() - (nextFrame.meta.epochTimestampUs / 1000))
                   : null;
@@ -2631,6 +2659,11 @@ class LuminaApp {
     if (this._nativeVideoWriter) {
       try { this._nativeVideoWriter.close(); } catch (_) {}
       this._nativeVideoWriter = null;
+    }
+    if (this._nativePumpPort1) {
+      this._nativePumpPort1.close();
+      this._nativePumpPort1 = null;
+      this._nativePumpPort2 = null;
     }
     this._nativeVideoGenerator = null;
     this._nativeVideoConfig = null;

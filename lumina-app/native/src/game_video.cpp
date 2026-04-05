@@ -241,11 +241,19 @@ static void captureLoop() {
     uint64_t skipCount      = 0;
     uint64_t queueDropCount = 0;
     auto     lastLogTime    = std::chrono::steady_clock::now();
+    uint64_t lastLogFrameCount = 0;
+    uint64_t lastLogSkipCount = 0;
+    uint64_t lastLogQueueDropCount = 0;
 
-    // Frame pacing — compute minimum interval for target FPS
-    const double targetIntervalUs = 1000000.0 / g_targetFps.load();
-    LARGE_INTEGER lastFrameTime;
-    QueryPerformanceCounter(&lastFrameTime);
+    // Frame pacing — hold a stable release cadence instead of accepting frames
+    // relative to the previous callback time. This reduces early/late clustering.
+    const int64_t targetIntervalTicks = static_cast<int64_t>(
+        (static_cast<double>(freq.QuadPart) / static_cast<double>(g_targetFps.load())) + 0.5);
+    const int64_t earlyAllowanceTicks = targetIntervalTicks / 10;
+    const int64_t lateResetTicks = targetIntervalTicks * 3;
+    LARGE_INTEGER nextFrameDeadline;
+    QueryPerformanceCounter(&nextFrameDeadline);
+    nextFrameDeadline.QuadPart += targetIntervalTicks;
 
     while (g_running.load(std::memory_order_relaxed)) {
         DXGI_OUTDUPL_FRAME_INFO frameInfo{};
@@ -283,15 +291,21 @@ static void captureLoop() {
         // ── Frame-pacing gate ──
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        double elapsedUs = (now.QuadPart - lastFrameTime.QuadPart) * 1000000.0 / freq.QuadPart;
-        if (elapsedUs < targetIntervalUs * 0.85) {
-            // Too soon — skip to hold target cadence
+        if ((now.QuadPart + earlyAllowanceTicks) < nextFrameDeadline.QuadPart) {
+            // Too soon for the next scheduled frame — skip and keep cadence stable.
             desktopResource->Release();
             g_duplication->ReleaseFrame();
             ++skipCount;
             continue;
         }
-        lastFrameTime = now;
+
+        if (now.QuadPart > (nextFrameDeadline.QuadPart + lateResetTicks)) {
+            nextFrameDeadline = now;
+        }
+
+        do {
+            nextFrameDeadline.QuadPart += targetIntervalTicks;
+        } while (nextFrameDeadline.QuadPart <= now.QuadPart);
 
         // ── Copy frame texture to staging ──
         ID3D11Texture2D* frameTex = nullptr;
@@ -363,14 +377,22 @@ static void captureLoop() {
         auto elapsed = std::chrono::steady_clock::now() - lastLogTime;
         if (elapsed >= std::chrono::seconds(5)) {
             double secs = std::chrono::duration<double>(elapsed).count();
-            VIDEO_LOG("frames=%llu fps=%.1f skipped=%llu queueDropped=%llu totalDropped=%llu output=%ux%u",
+            const uint64_t framesThisWindow = frameCount - lastLogFrameCount;
+            const uint64_t skipsThisWindow = skipCount - lastLogSkipCount;
+            const uint64_t queueDropsThisWindow = queueDropCount - lastLogQueueDropCount;
+            VIDEO_LOG("frames=%llu windowFps=%.1f skipped=%llu windowSkipped=%llu queueDropped=%llu windowQueueDropped=%llu totalDropped=%llu output=%ux%u",
                       static_cast<unsigned long long>(frameCount),
-                      frameCount / secs,
+                      framesThisWindow / secs,
                       static_cast<unsigned long long>(skipCount),
+                      static_cast<unsigned long long>(skipsThisWindow),
                       static_cast<unsigned long long>(queueDropCount),
+                      static_cast<unsigned long long>(queueDropsThisWindow),
                       static_cast<unsigned long long>(g_framesDropped.load()),
                       g_outputWidth, g_outputHeight);
             lastLogTime = std::chrono::steady_clock::now();
+            lastLogFrameCount = frameCount;
+            lastLogSkipCount = skipCount;
+            lastLogQueueDropCount = queueDropCount;
         }
     }
 

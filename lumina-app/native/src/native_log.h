@@ -15,13 +15,35 @@ inline bool g_logInitialised = false;
 inline bool g_logEnabled = false;
 inline char g_logPath[MAX_PATH] = { 0 };
 
-inline void ensureInitialised() {
-    if (g_logInitialised) return;
+inline void refreshPathFromEnv() {
     const char* path = std::getenv("LUMINA_NATIVE_LOG_PATH");
     if (path && *path) {
-        std::strncpy(g_logPath, path, sizeof(g_logPath) - 1);
+        if (std::strncmp(g_logPath, path, sizeof(g_logPath) - 1) != 0) {
+            std::memset(g_logPath, 0, sizeof(g_logPath));
+            std::strncpy(g_logPath, path, sizeof(g_logPath) - 1);
+        }
         g_logEnabled = true;
+    } else {
+        std::memset(g_logPath, 0, sizeof(g_logPath));
+        g_logEnabled = false;
     }
+}
+
+inline void ensureInitialised() {
+    if (!g_logInitialised) {
+        g_logInitialised = true;
+    }
+    refreshPathFromEnv();
+}
+
+inline void setPath(const char* path) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (path && *path) {
+        _putenv_s("LUMINA_NATIVE_LOG_PATH", path);
+    } else {
+        _putenv_s("LUMINA_NATIVE_LOG_PATH", "");
+    }
+    g_logInitialised = false;
     g_logInitialised = true;
 }
 

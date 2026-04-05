@@ -1,0 +1,12 @@
+{
+  "sessionId": "2026-04-05T20-40-19-924Z",
+  "gitCommit": "8550284",
+  "startedAt": "2026-04-05T20:40:19.924Z",
+  "server": "signaling-server",
+  "announcedIp": null,
+  "nodeVersion": "v22.19.0",
+  "platform": "win32",
+  "arch": "x64",
+  "sessionDir": "C:\\Users\\User\\Lumina\\logs\\sessions\\2026-04-05T20-40-19-924Z-8550284",
+  "reason": "startup"
+}

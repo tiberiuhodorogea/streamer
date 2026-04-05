@@ -1240,9 +1240,12 @@ class LuminaApp {
       this._nativeVideoGenerator = null;  // MediaStreamTrackGenerator if available
       this._nativeVideoWriter = null;
       this._nativeVideoLatestFrame = null;
+      this._nativeVideoDeferredFrame = null;
       this._nativeVideoWriteInFlight = false;
-        this._nativeVideoPumpScheduled = false;
+      this._nativeVideoPumpScheduled = false;
+      this._nativeVideoDelayedPumpTimer = null;
       this._nativeVideoDroppedFrames = 0;
+      this._nativeVideoPacingDeferredDrops = 0;
       this._nativeVideoLastFrameAgeMs = null;
       this._nativeVideoMaxFrameAgeMs = 0;
       this._nativeVideoAgeSampleTotalMs = 0;
@@ -1424,10 +1427,12 @@ class LuminaApp {
 
     const payload = {
       droppedFrames,
+      pacingDeferredDrops: this._nativeVideoPacingDeferredDrops || 0,
       mainToRendererMs: details.mainToRendererMs ?? null,
       captureToRendererMs: details.captureToRendererMs ?? null,
       frameWidth: details.width ?? null,
       frameHeight: details.height ?? null,
+      reason: details.reason || 'latest-frame-overwritten',
       writeInFlight: !!this._nativeVideoWriteInFlight,
       captureMethod: this._currentCaptureMethod || null,
       signalingSessionId: this._getCurrentSignalingSessionId(),
@@ -1435,6 +1440,7 @@ class LuminaApp {
     };
 
     logger.warn('[NATIVE-VIDEO] Renderer backpressure dropping stale frames=' + droppedFrames +
+      ' deferredDrops=' + (payload.pacingDeferredDrops || 0) +
       ' mainToRenderer=' + (payload.mainToRendererMs != null ? payload.mainToRendererMs.toFixed(1) : '--') +
       'ms capToRenderer=' + (payload.captureToRendererMs != null ? payload.captureToRendererMs.toFixed(1) : '--') + 'ms');
 
@@ -1877,6 +1883,13 @@ class LuminaApp {
       try {
         this._signalingSessionInfo = data.signalingSession || null;
         if (this._signalingSessionInfo) {
+          if (window.electron?.bindSignalingSessionDir && this._signalingSessionInfo.sessionDirName) {
+            try {
+              await window.electron.bindSignalingSessionDir(this._signalingSessionInfo.sessionDirName);
+            } catch (bindError) {
+              logger.warn('[SESSION] Failed to rebind session dir: ' + bindError.message);
+            }
+          }
           logger.info('[SESSION] Bound to signaling session ' + this._signalingSessionInfo.sessionId +
             ' (' + this._signalingSessionInfo.sessionDirName + ')');
           this._logSession('signaling-session-bound', {
@@ -2377,8 +2390,9 @@ class LuminaApp {
     }
 
     const { width, height } = result;
-    this._nativeVideoConfig = { width, height, targetFps, maxWidth, maxHeight };
-    logger.info('[NATIVE-VIDEO] DXGI capture started: ' + width + 'x' + height + ' target=' + targetFps + 'fps');
+    const bridgeMode = result?.bridgeMode || 'preload-direct';
+    this._nativeVideoConfig = { width, height, targetFps, maxWidth, maxHeight, bridgeMode };
+    logger.info('[NATIVE-VIDEO] DXGI capture started: ' + width + 'x' + height + ' target=' + targetFps + 'fps bridge=' + bridgeMode);
 
     const maxNativeWritesPerTurn = 3;
     const nativePumpBudgetMs = 8;
@@ -2394,16 +2408,21 @@ class LuminaApp {
         this._nativeVideoActive = true;
         this._nativeVideoFrameCount = 0;
         this._nativeVideoLatestFrame = null;
+        this._nativeVideoDeferredFrame = null;
         this._nativeVideoWriteInFlight = false;
         this._nativeVideoPumpScheduled = false;
+        this._nativeVideoDelayedPumpTimer = null;
         this._nativeVideoDroppedFrames = 0;
+        this._nativeVideoPacingDeferredDrops = 0;
         this._resetNativeFrameTelemetry();
         this._lastNativeRendererBackpressureLogAtMs = 0;
 
         // MessageChannel fires as a task-queue job, not tied to display vsync.
         // requestAnimationFrame caps the pump to the display refresh rate and
-        // defers during renderer-thread pauses, causing mainToRendererMs spikes
-        // and limiting source-FPS delivery from high-FPS games to ~display-Hz.
+        // defers during renderer-thread pauses, causing bridge-to-renderer spikes.
+        // The native bridge now feeds the renderer directly. We keep a paced
+        // deferred slot plus a latest-arrival slot so timing jitter does not
+        // overwrite the next frame we intentionally held for cadence.
         const { port1: _pumpPort1, port2: _pumpPort2 } = new MessageChannel();
         this._nativePumpPort1 = _pumpPort1;
         this._nativePumpPort2 = _pumpPort2;
@@ -2412,8 +2431,23 @@ class LuminaApp {
         const _maxFrameAgeMs = _frameIntervalMs * 2.5;  // ~41ms at 60fps
         let _lastFrameWrittenAtMs = 0;
 
+        const scheduleDelayedPump = (delayMs) => {
+          if (this._nativeVideoDelayedPumpTimer || !this._nativeVideoActive) {
+            return;
+          }
+          this._nativeVideoDelayedPumpTimer = setTimeout(() => {
+            this._nativeVideoDelayedPumpTimer = null;
+            schedulePump();
+          }, Math.max(1, delayMs));
+        };
+
         const schedulePump = () => {
-          if (this._nativeVideoPumpScheduled || this._nativeVideoWriteInFlight || !this._nativeVideoActive || !this._nativeVideoLatestFrame) {
+          if (
+            this._nativeVideoPumpScheduled ||
+            this._nativeVideoWriteInFlight ||
+            !this._nativeVideoActive ||
+            (!this._nativeVideoDeferredFrame && !this._nativeVideoLatestFrame)
+          ) {
             return;
           }
           this._nativeVideoPumpScheduled = true;
@@ -2433,10 +2467,12 @@ class LuminaApp {
             let writesThisTurn = 0;
 
             while (this._nativeVideoActive) {
-              const nextFrame = this._nativeVideoLatestFrame;
+              const fromDeferred = !!this._nativeVideoDeferredFrame;
+              const nextFrame = this._nativeVideoDeferredFrame || this._nativeVideoLatestFrame;
               if (!nextFrame) break;
 
-              this._nativeVideoLatestFrame = null;
+              if (fromDeferred) this._nativeVideoDeferredFrame = null;
+              else this._nativeVideoLatestFrame = null;
 
               // Drop stale frames: if this frame sat in the pipeline longer than
               // 2.5× the target interval the encoder would encode frozen content.
@@ -2447,13 +2483,12 @@ class LuminaApp {
                 continue;
               }
 
-              // Pace output to targetFps: the capture source delivers at the
-              // game's frame rate (e.g. 120 fps). Writing every frame would
-              // double the encoder load with no quality benefit.
+              // Pace output to targetFps: absorbs IPC jitter so bursts of compressed
+              // frame arrivals don't hit the encoder together and cause stalls.
               const _sinceLast = performance.now() - _lastFrameWrittenAtMs;
               if (_lastFrameWrittenAtMs > 0 && _sinceLast < _frameIntervalMs * 0.8) {
-                this._nativeVideoLatestFrame = nextFrame; // put back for next turn
-                setTimeout(schedulePump, Math.ceil(_frameIntervalMs * 0.8 - _sinceLast));
+                this._nativeVideoDeferredFrame = nextFrame;
+                scheduleDelayedPump(Math.ceil(_frameIntervalMs * 0.8 - _sinceLast));
                 break;
               }
 
@@ -2506,7 +2541,7 @@ class LuminaApp {
               }
 
               writesThisTurn++;
-              if (!this._nativeVideoLatestFrame) {
+              if (!this._nativeVideoDeferredFrame && !this._nativeVideoLatestFrame) {
                 break;
               }
 
@@ -2521,7 +2556,7 @@ class LuminaApp {
             }
           } finally {
             this._nativeVideoWriteInFlight = false;
-            if (this._nativeVideoActive && this._nativeVideoLatestFrame) {
+            if (this._nativeVideoActive && (this._nativeVideoDeferredFrame || this._nativeVideoLatestFrame)) {
               schedulePump();
             }
           }
@@ -2536,6 +2571,14 @@ class LuminaApp {
           const captureToRendererMs = meta?.epochTimestampUs
             ? Math.max(0, receivedAtEpochMs - (meta.epochTimestampUs / 1000))
             : null;
+          const incomingFrame = {
+            buffer,
+            meta,
+            receivedAtEpochMs,
+            mainToRendererMs,
+            captureToRendererMs,
+          };
+
           if (this._nativeVideoLatestFrame) {
             this._nativeVideoDroppedFrames++;
             this._maybeLogNativeRendererBackpressure({
@@ -2543,16 +2586,17 @@ class LuminaApp {
               captureToRendererMs,
               width: meta?.width,
               height: meta?.height,
+              reason: this._nativeVideoDeferredFrame ? 'latest-overwritten-while-paced' : 'latest-overwritten-before-pump',
             });
+            if (this._nativeVideoDeferredFrame) {
+              this._nativeVideoPacingDeferredDrops++;
+            }
           }
-          this._nativeVideoLatestFrame = {
-            buffer,
-            meta,
-            receivedAtEpochMs,
-            mainToRendererMs,
-            captureToRendererMs,
-          };
-          schedulePump();
+          this._nativeVideoLatestFrame = incomingFrame;
+
+          if (!(this._nativeVideoDeferredFrame && this._nativeVideoDelayedPumpTimer)) {
+            schedulePump();
+          }
         });
 
         const stream = new MediaStream([generator]);
@@ -2560,7 +2604,9 @@ class LuminaApp {
 
         if (window.electron?.sessionLog) {
           window.electron.sessionLog('native-video-started', {
-            width, height, targetFps, maxWidth, maxHeight, method: 'MediaStreamTrackGenerator',
+            width, height, targetFps, maxWidth, maxHeight,
+            method: 'MediaStreamTrackGenerator',
+            bridgeMode,
           });
         }
 
@@ -2664,7 +2710,12 @@ class LuminaApp {
   async _stopNativeVideoCapture() {
     this._nativeVideoActive = false;
     this._nativeVideoLatestFrame = null;
+    this._nativeVideoDeferredFrame = null;
     this._nativeVideoWriteInFlight = false;
+    if (this._nativeVideoDelayedPumpTimer) {
+      clearTimeout(this._nativeVideoDelayedPumpTimer);
+      this._nativeVideoDelayedPumpTimer = null;
+    }
 
     if (window.electron?.removeGameVideoFrameListener) {
       window.electron.removeGameVideoFrameListener();
@@ -2710,11 +2761,13 @@ class LuminaApp {
         window.electron.sessionLog('native-video-stopped', {
           framesDelivered: frames,
           framesDropped: this._nativeVideoDroppedFrames || 0,
+          pacingDeferredDrops: this._nativeVideoPacingDeferredDrops || 0,
           frameAge: this._getNativeFrameTelemetrySnapshot(),
         });
       }
     }
     this._nativeVideoDroppedFrames = 0;
+    this._nativeVideoPacingDeferredDrops = 0;
     this._resetNativeFrameTelemetry();
   }
 
@@ -2839,6 +2892,7 @@ class LuminaApp {
               snapshot.capture = {
                 ...this._lastPipelineSnapshot.capture,
                 nativeDroppedFrames: this._nativeVideoDroppedFrames || 0,
+                nativePacingDeferredDrops: this._nativeVideoPacingDeferredDrops || 0,
                 nativeCapture: this._nativeVideoActive || false,
                 nativeFrameCount: this._nativeVideoFrameCount || 0,
               };

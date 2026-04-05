@@ -1,0 +1,113 @@
+{
+  "label": "Stable preload-direct baseline: cleaned transport + two-slot renderer pacing",
+  "date": "2026-04-05",
+  "commit": "8550284",
+  "sessionDir": "2026-04-05T20-40-19-924Z-8550284",
+  "sessionDurationSec": 274.7,
+  "refreshRequiredCount": 0,
+  "viewerBuildId": "viewer-sfu-3",
+  "abrEvents": {
+    "degrades": 0,
+    "recovers": 1
+  },
+  "tierDistribution": {
+    "FLOW": {
+      "snapshots": 1,
+      "pct": 2.3
+    },
+    "FULL": {
+      "snapshots": 42,
+      "pct": 97.7
+    }
+  },
+  "streamer": {
+    "bitrateMbps": {
+      "avg": 10.3,
+      "min": 1.3,
+      "max": 15.4,
+      "p5": 2.1,
+      "p95": 14.1
+    },
+    "fps": {
+      "avg": 54.6,
+      "min": 46,
+      "max": 60,
+      "p5": 50,
+      "p95": 58
+    },
+    "sourceFps": {
+      "avg": 54.7,
+      "min": 45,
+      "max": 61,
+      "p5": 50,
+      "p95": 59
+    },
+    "bweAvailableMbps": {
+      "avg": 14.1,
+      "min": 5.5,
+      "max": 21.2,
+      "p5": 6.3,
+      "p95": 20.7
+    },
+    "encoderStalls": 0,
+    "encoderPressureEvents": 2,
+    "nativeDroppedFrames": 301,
+    "nativeBackpressureEvents": 37,
+    "nativePacingDeferredDrops": 0
+  },
+  "viewer": {
+    "fps": {
+      "avg": 54.1,
+      "min": 0,
+      "max": 71,
+      "p5": 46,
+      "p95": 59
+    },
+    "jitterBufferDelayMs": {
+      "avg": 49.3,
+      "min": 11.1,
+      "max": 57.4,
+      "p5": 19.3,
+      "p95": 56.9
+    },
+    "jitterBufferDeltaMs": {
+      "avg": 0.2,
+      "min": -1.7,
+      "max": 3.6,
+      "p5": -0.1,
+      "p95": 1.1
+    },
+    "decodeLatencyMs": {
+      "avg": 6.5,
+      "min": 4.4,
+      "max": 7.6,
+      "p5": 4.6,
+      "p95": 7.6
+    },
+    "playoutDriftMs": {
+      "avg": 990.9
+    },
+    "slowdowns": {
+      "count": 7,
+      "pct": 3.3
+    },
+    "speedups": {
+      "count": 4,
+      "pct": 1.9
+    },
+    "droppedFrames": 0,
+    "lossRate": 0.0002,
+    "resolution": {
+      "1280x720": 4,
+      "1600x900": 209
+    }
+  },
+  "notes": [
+    "Best steady-state run so far after transport cleanup: 97.7% FULL with sustained 1600x900 output.",
+    "Preload-direct path and two-slot renderer pacing removed deferred-frame overwrite regressions; nativePacingDeferredDrops stayed at 0.",
+    "Native source cadence is now consistently ~56-58fps in native-addon.log, with no catastrophic native pipeline lag events.",
+    "Remaining issue is non-deferred renderer overwrite before pump: nativeDroppedFrames still accumulated to ~300 and viewer jitter buffer settled around 55ms, so smoothness is strong but not yet premium-locked.",
+    "Next opportunity: replace single latest-arrival slot with a small bounded renderer queue and add queue-depth telemetry to cut remaining backpressure."
+  ],
+  "supersedes": "2026-04-05T20-14-47-124Z-8550284"
+}
